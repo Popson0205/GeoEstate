@@ -1,0 +1,15 @@
+{
+  "name": "geoestate-api",
+  "version": "1.0.0",
+  "description": "GeoEstate OTP & Registration API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.11.0"
+  }
+}
