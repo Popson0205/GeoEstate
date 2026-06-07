@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: geoestate-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: SECRET_RESEND_API_KEY
+        sync: false
+      - key: SECRET_NEON_DATABASE_URL
+        sync: false
