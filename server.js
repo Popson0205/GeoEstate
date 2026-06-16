@@ -54,7 +54,15 @@ function requireOwner(req, res) {
     json(res, 401, { error: 'Owner authentication required' });
     return null;
   }
-  return token.replace('owner:', '');
+  // Token format: owner:<userId>:<timestamp>
+  // Extract userId (everything between first and last colon-timestamp)
+  const parts = token.split(':');
+  if (parts.length < 2) { json(res, 401, { error: 'Invalid token format' }); return null; }
+  // parts[0]='owner', parts[1]=userId (may contain hyphens), parts[last]=timestamp
+  // Remove 'owner' prefix and trailing timestamp
+  parts.shift(); // remove 'owner'
+  parts.pop();   // remove timestamp
+  return parts.join(':'); // rejoin in case userId had colons
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -597,19 +605,27 @@ async function handleOwnerLogin(data, res) {
   if (code !== record.code) return json(res, 400, { error: 'Incorrect code.' });
   delete otpStore['owner:' + email.toLowerCase()];
 
-  // Find user
+  // Find user — accept any registered email, owner role not strictly required
   try {
-    const r = await db.query('SELECT * FROM registrations WHERE email=$1 AND role=$2', [email.toLowerCase(), 'owner']);
-    if (!r.rows.length) return json(res, 404, { error: 'No owner account found for this email. Please register first.' });
+    const r = await db.query('SELECT * FROM registrations WHERE email=$1', [email.toLowerCase()]);
+    if (!r.rows.length) return json(res, 404, {
+      error: 'No account found for this email. Please register on the website first.',
+      hint: 'Visit geoestate.com.ng and complete the registration form before logging in here.'
+    });
     const u = r.rows[0];
+    // Auto-upgrade role to owner if they're logging into owner portal
+    if (u.role !== 'owner') {
+      await db.query("UPDATE registrations SET role='owner', type='owner', updated_at=NOW() WHERE id=$1", [u.id]);
+      u.role = 'owner';
+    }
     const token = 'owner:' + u.id + ':' + Date.now();
     json(res, 200, {
       success: true,
       token,
       owner: {
         id: u.id, fname: u.fname, lname: u.lname, email: u.email,
-        phone: u.phone, is_verified: u.is_verified, owner_since: u.owner_since,
-        status: u.status
+        phone: u.phone, is_verified: u.is_verified || false, owner_since: u.owner_since,
+        status: u.status, role: u.role
       }
     });
   } catch(e) { json(res, 500, { error: e.message }); }
