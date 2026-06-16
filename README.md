@@ -1,30 +1,50 @@
-# GeoEstate API Server
+# GeoEstate API v2.0
 
-## Deploy to Render.com (Free)
+Node.js + PostgreSQL (Neon) — Deployed on Render.com
 
-1. Go to https://render.com → Sign up/login
-2. Click **New** → **Web Service**
-3. Connect your GitHub account → Upload this folder as a repo
-   OR use **Deploy from existing repo** if you push this to GitHub
-4. Set these Environment Variables in Render dashboard:
-   - `SECRET_RESEND_API_KEY` = your Resend API key (re_xxx...)
-   - `SECRET_NEON_DATABASE_URL` = your Neon connection string (postgresql://...)
-5. Click **Deploy**
-6. Your API URL will be: https://geoestate-api.onrender.com
+## Setup
 
-## Endpoints
-- GET  /                    → health check
-- POST /send-otp            → send email OTP
-- POST /verify-otp          → verify OTP code
-- POST /register            → save new user registration
-- GET  /admin/registrations → get all registrations
-- GET  /admin/properties    → get all properties
-- GET  /admin/team          → get team members
-- GET  /admin/lawyers       → get lawyers
-- GET  /admin/transactions  → get transactions
-- GET  /admin/tenancies     → get tenancies
-- POST /admin/save-lawyer   → add/update lawyer
-- POST /admin/save-team     → add/update team member
-- POST /admin/save-tenancy  → add tenancy record
-- PATCH /admin/registration/:id → update registration status
-- PATCH /admin/property/:id     → update property
+1. Set environment variables on Render:
+   - `SECRET_NEON_DATABASE_URL` — your Neon connection string
+   - `SECRET_RESEND_API_KEY` — your Resend API key
+   - `ADMIN_SECRET` — your admin token (keep this secret)
+
+2. Run `schema.sql` on your Neon database to apply migrations
+
+3. Deploy: push to GitHub → Render auto-deploys
+
+## Admin Authentication
+
+All `/admin/*` routes require:
+```
+Authorization: Bearer YOUR_ADMIN_SECRET
+```
+or
+```
+X-Admin-Token: YOUR_ADMIN_SECRET
+```
+
+## Owner Authentication
+
+1. POST `/owner/login` with `{ email }` → OTP sent
+2. POST `/owner/login` with `{ email, code }` → returns `token`
+3. Use token on all owner requests:
+```
+Authorization: Bearer owner:<userId>:<timestamp>
+```
+
+## New in v2.0
+
+- ✅ Admin auth middleware on all /admin/* routes
+- ✅ POST /admin/create-property (and /admin/save-property)
+- ✅ GET /properties with ?type=rent|buy|lease filter
+- ✅ GET /properties/:id (single property with units)
+- ✅ Owner dashboard routes (/owner/*)
+- ✅ One-time identity verification for owners
+- ✅ Property units CRUD (/owner/property/:id/units)
+- ✅ listing_type separation (rent/buy/lease)
+- ✅ Enquiry system (POST /enquiry)
+- ✅ Server-Sent Events (GET /events) for real-time sync
+- ✅ Payment tracking with tenancy linkage
+- ✅ Activity log broadcast via SSE
+- ✅ node_modules removed from repo (.gitignore added)
