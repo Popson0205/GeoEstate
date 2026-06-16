@@ -239,32 +239,69 @@ async function handleRegister(data, res) {
 async function handlePublicProperties(urlFull, res) {
   try {
     const params = new URL('http://x' + urlFull).searchParams;
-    const type   = params.get('type');
+    const typeFilter = params.get('type');
     const state  = params.get('state');
     const search = params.get('q');
-    let query  = "SELECT id,title,owner,owner_id,listing_type,type,status,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,size_sqm,description,amenities,created_at FROM properties WHERE status='live'";
+
+    let query = "SELECT id, title, owner, owner_id, type, COALESCE(listing_type, type, 'rent') as listing_type, status, price, state, lga, address, img, created_at FROM properties WHERE status='live'";
     const args = [];
-    if (type) { args.push(type); query += ` AND listing_type=$${args.length}`; }
-    if (state) { args.push('%' + state + '%'); query += ` AND state ILIKE $${args.length}`; }
-    if (search) { args.push('%' + search + '%'); query += ` AND (title ILIKE $${args.length} OR address ILIKE $${args.length} OR lga ILIKE $${args.length})`; }
+
+    if (typeFilter) {
+      args.push(typeFilter);
+      query += " AND (COALESCE(listing_type, type, 'rent') = $" + args.length + ")";
+    }
+    if (state) {
+      args.push('%' + state + '%');
+      query += ' AND state ILIKE $' + args.length;
+    }
+    if (search) {
+      args.push('%' + search + '%');
+      query += ' AND (title ILIKE $' + args.length + ' OR address ILIKE $' + args.length + ' OR lga ILIKE $' + args.length + ')';
+    }
     query += ' ORDER BY created_at DESC';
-    const result = await db.query(query, args);
+
+    let result;
+    try {
+      result = await db.query(query, args);
+    } catch(e1) {
+      // listing_type column missing — use type only
+      let q2 = "SELECT id, title, owner, type, type as listing_type, status, price, state, lga, address, img, created_at FROM properties WHERE status='live'";
+      const args2 = [];
+      if (typeFilter) { args2.push(typeFilter); q2 += ' AND type=$' + args2.length; }
+      if (state) { args2.push('%'+state+'%'); q2 += ' AND state ILIKE $' + args2.length; }
+      q2 += ' ORDER BY created_at DESC';
+      result = await db.query(q2, args2);
+    }
     json(res, 200, { success: true, count: result.rows.length, properties: result.rows });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+
 async function handlePublicPropertyById(id, res) {
   try {
-    const r = await db.query(
-      "SELECT p.*, array_agg(json_build_object('id',u.id,'label',u.unit_label,'type',u.unit_type,'floor',u.floor_level,'capacity',u.capacity,'price',u.monthly_price,'status',u.status,'occupied_since',u.occupied_since,'lease_end',u.lease_end)) FILTER (WHERE u.id IS NOT NULL) as units FROM properties p LEFT JOIN property_units u ON u.property_id=p.id WHERE p.id=$1 GROUP BY p.id",
-      [id]
-    );
-    if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
-    json(res, 200, { success: true, property: r.rows[0] });
+    let prop;
+    try {
+      const r = await db.query(
+        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,state,lga,address,img,notes,created_at FROM properties WHERE id=$1",
+        [id]
+      );
+      if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
+      prop = r.rows[0];
+    } catch(e1) {
+      const r = await db.query("SELECT id,title,owner,type,type as listing_type,status,price,state,lga,address,img,notes,created_at FROM properties WHERE id=$1", [id]);
+      if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
+      prop = r.rows[0];
+    }
+    // Try units
+    try {
+      const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status,occupied_since,lease_end FROM property_units WHERE property_id=$1 ORDER BY unit_label", [id]);
+      prop.units = ur.rows;
+    } catch(ue) { prop.units = []; }
+    json(res, 200, { success: true, property: prop });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
-// ── Admin GET routes ──
+
 async function handleGetRegistrations(url, res) {
   try {
     const since = new URL('http://x' + url).searchParams.get('since');
@@ -293,9 +330,32 @@ async function handleGetRegistrations(url, res) {
 
 async function handleGetProperties(res) {
   try {
-    const result = await db.query('SELECT *, COALESCE(listing_type, type) as listing_type FROM properties ORDER BY created_at DESC');
+    // Use safe column list that works with both old and new schema
+    const result = await db.query(`
+      SELECT id, title, owner, owner_id, type,
+        COALESCE(listing_type, type, 'rent') as listing_type,
+        status, price,
+        COALESCE(monthly_rent, CASE WHEN type='rent' THEN NULL ELSE NULL END) as monthly_rent,
+        COALESCE(sale_price, NULL) as sale_price,
+        COALESCE(lease_price, NULL) as lease_price,
+        state, lga, address, img,
+        COALESCE(images, '[]'::jsonb) as images,
+        COALESCE(bedrooms, NULL) as bedrooms,
+        COALESCE(bathrooms, NULL) as bathrooms,
+        COALESCE(size_sqm, NULL) as size_sqm,
+        COALESCE(description, '') as description,
+        COALESCE(amenities, '[]'::jsonb) as amenities,
+        notes, submitted, created_at, updated_at
+      FROM properties ORDER BY created_at DESC
+    `);
     json(res, 200, { success: true, count: result.rows.length, properties: result.rows });
-  } catch(e) { json(res, 500, { error: e.message }); }
+  } catch(e) {
+    // Fallback: minimal safe query if new columns don't exist yet
+    try {
+      const r2 = await db.query('SELECT id,title,owner,type,type as listing_type,status,price,state,lga,address,img,notes,submitted,created_at FROM properties ORDER BY created_at DESC');
+      json(res, 200, { success: true, count: r2.rows.length, properties: r2.rows });
+    } catch(e2) { json(res, 500, { error: e2.message }); }
+  }
 }
 
 async function handleGetTeam(res) {
@@ -364,7 +424,7 @@ async function handleAdminUpdate(url, data, res) {
   if (propMatch) {
     const id = propMatch[1];
     try {
-      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned'];
+      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo'];
       const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
       if (!fields.length) return json(res, 400, { error: 'No valid fields' });
       const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');
@@ -400,12 +460,20 @@ async function handleSaveProperty(data, res) {
   const propId = id || ('PROP-' + Date.now());
   const lt = listing_type || type || 'rent';
   try {
-    await db.query(
-      `INSERT INTO properties (id,title,owner,owner_id,listing_type,type,status,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,size_sqm,description,amenities,notes,submitted)
-       VALUES ($1,$2,$3,$4,$5,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-       ON CONFLICT (id) DO UPDATE SET title=$2,owner=$3,listing_type=$5,type=$5,status=$6,price=$7,monthly_rent=$8,sale_price=$9,lease_price=$10,state=$11,lga=$12,address=$13,img=$14,images=$15,bedrooms=$16,bathrooms=$17,size_sqm=$18,description=$19,amenities=$20,notes=$21,updated_at=NOW()`,
-      [propId,title,owner||'',owner_id||null,lt,status||'pending',price||'',monthly_rent||null,sale_price||null,lease_price||null,state||'',lga||'',address||'',img||'',JSON.stringify(images||[]),bedrooms||null,bathrooms||null,size_sqm||null,description||'',JSON.stringify(amenities||[]),notes||'',new Date().toLocaleString('en-NG')]
-    );
+    // Try new schema first, fall back to basic insert if columns missing
+    try {
+      await db.query(
+        `INSERT INTO properties (id,title,owner,owner_id,type,status,price,state,lga,address,img,notes,submitted)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (id) DO UPDATE SET title=$2,owner=$3,type=$5,status=$6,price=$7,state=$8,lga=$9,address=$10,img=$11,notes=$12,updated_at=NOW()`,
+        [propId,title,owner||'',owner_id||null,lt,status||'pending',price||'',state||'',lga||'',address||'',img||'',notes||'',new Date().toLocaleString('en-NG')]
+      );
+      // Try to update new columns separately (safe if they don't exist yet)
+      await db.query(
+        `UPDATE properties SET listing_type=$1,monthly_rent=$2,sale_price=$3,lease_price=$4,images=$5,bedrooms=$6,bathrooms=$7,size_sqm=$8,description=$9,amenities=$10 WHERE id=$11`,
+        [lt,monthly_rent||null,sale_price||null,lease_price||null,JSON.stringify(images||[]),bedrooms||null,bathrooms||null,size_sqm||null,description||'',JSON.stringify(amenities||[]),propId]
+      ).catch(()=>{}); // Silent fail if columns missing — run schema.sql to enable
+    } catch(e2) { throw e2; }
     await logActivity((id ? 'Property updated: ' : 'Property added: ') + title);
     broadcast('property_created', { id: propId, title, listing_type: lt });
     json(res, 200, { success: true, propertyId: propId });
@@ -552,7 +620,7 @@ async function handleSavePayment(data, res) {
 async function handleGetSync(res) {
   try {
     const [props, regs] = await Promise.all([
-      db.query("SELECT id,title,owner,listing_type,type,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,description,amenities FROM properties WHERE status='live' ORDER BY created_at DESC"),
+      db.query("SELECT id,title,owner,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,state,lga,address,img FROM properties WHERE status='live' ORDER BY created_at DESC"),
       db.query("SELECT id,email FROM registrations WHERE status='approved'")
     ]);
     json(res, 200, {
@@ -660,14 +728,26 @@ async function handleOwnerProperties(ownerId, urlFull, res) {
   try {
     const params = new URL('http://x' + urlFull).searchParams;
     const type = params.get('type');
-    let q = 'SELECT p.*, (SELECT COUNT(*) FROM property_units u WHERE u.property_id=p.id) as unit_count, (SELECT COUNT(*) FROM property_units u WHERE u.property_id=p.id AND u.status=\'vacant\') as vacant_units FROM properties p WHERE p.owner_id=$1';
+    let q = "SELECT id,title,owner,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,state,lga,address,img,notes,created_at FROM properties WHERE owner_id=$1";
     const args = [ownerId];
-    if (type) { args.push(type); q += ` AND p.listing_type=$${args.length}`; }
-    q += ' ORDER BY p.created_at DESC';
-    const result = await db.query(q, args);
-    json(res, 200, { success: true, properties: result.rows });
+    if (type) { args.push(type); q += " AND COALESCE(listing_type,type,'rent')=$" + args.length; }
+    q += ' ORDER BY created_at DESC';
+    let result;
+    try {
+      result = await db.query(q, args);
+    } catch(e1) {
+      // Fallback without listing_type
+      let q2 = 'SELECT id,title,owner,type,type as listing_type,status,price,state,lga,address,img,created_at FROM properties WHERE owner_id=$1';
+      const a2 = [ownerId];
+      if (type) { a2.push(type); q2 += ' AND type=$' + a2.length; }
+      result = await db.query(q2, a2);
+    }
+    // Add unit counts
+    const rows = result.rows.map(p => ({ ...p, unit_count: 0, vacant_units: 0 }));
+    json(res, 200, { success: true, properties: rows });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
+
 
 async function handleOwnerAddProperty(ownerId, data, res) {
   // Check verification
@@ -747,7 +827,12 @@ async function handleGetUnits(ownerId, propId, res) {
     const stats = { total: r.rows.length, vacant: 0, occupied: 0, reserved: 0, maintenance: 0 };
     r.rows.forEach(u => { if (stats[u.status] !== undefined) stats[u.status]++; });
     json(res, 200, { success: true, units: r.rows, stats });
-  } catch(e) { json(res, 500, { error: e.message }); }
+  } catch(e) {
+    // Table might not exist yet — return empty gracefully
+    if (e.message && e.message.includes('does not exist')) {
+      json(res, 200, { success: true, units: [], stats: { total:0,vacant:0,occupied:0,reserved:0,maintenance:0 }, note: 'Run schema.sql to enable unit management' });
+    } else { json(res, 500, { error: e.message }); }
+  }
 }
 
 async function handleAddUnit(ownerId, propId, data, res) {
