@@ -823,6 +823,15 @@ async function handleGetUnits(ownerId, propId, res) {
     if (!own.rows.length) return json(res, 403, { error: 'Property not found or not yours' });
   }
   try {
+    // Auto-create table if missing
+    await db.query(`CREATE TABLE IF NOT EXISTS property_units (
+      id SERIAL PRIMARY KEY, property_id TEXT REFERENCES properties(id) ON DELETE CASCADE,
+      unit_label VARCHAR(100) NOT NULL, unit_type VARCHAR(50) DEFAULT 'room',
+      floor_level VARCHAR(20) DEFAULT '', capacity INTEGER DEFAULT 1,
+      monthly_price NUMERIC, status VARCHAR(20) DEFAULT 'vacant',
+      current_tenant_id TEXT, occupied_since DATE, lease_end DATE,
+      notes TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`).catch(()=>{});
     const r = await db.query('SELECT * FROM property_units WHERE property_id=$1 ORDER BY unit_label', [propId]);
     const stats = { total: r.rows.length, vacant: 0, occupied: 0, reserved: 0, maintenance: 0 };
     r.rows.forEach(u => { if (stats[u.status] !== undefined) stats[u.status]++; });
@@ -885,6 +894,15 @@ async function handleDeleteUnit(ownerId, propId, unitId, res) {
 // Admin unit management
 async function handleAdminGetUnits(propId, res) {
   try {
+    // Auto-create table if missing
+    await db.query(`CREATE TABLE IF NOT EXISTS property_units (
+      id SERIAL PRIMARY KEY, property_id TEXT REFERENCES properties(id) ON DELETE CASCADE,
+      unit_label VARCHAR(100) NOT NULL, unit_type VARCHAR(50) DEFAULT 'room',
+      floor_level VARCHAR(20) DEFAULT '', capacity INTEGER DEFAULT 1,
+      monthly_price NUMERIC, status VARCHAR(20) DEFAULT 'vacant',
+      current_tenant_id TEXT, occupied_since DATE, lease_end DATE,
+      notes TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`).catch(()=>{});
     const r = await db.query('SELECT * FROM property_units WHERE property_id=$1 ORDER BY unit_label', [propId]);
     json(res, 200, { success: true, units: r.rows });
   } catch(e) { json(res, 500, { error: e.message }); }
@@ -899,6 +917,13 @@ async function handleEnquiry(data, res) {
   if (!property_id || !name || !email) return json(res, 400, { error: 'property_id, name and email required' });
   const id = 'ENQ-' + Date.now();
   try {
+    // Create enquiries table if not exists (idempotent)
+    await db.query(`CREATE TABLE IF NOT EXISTS enquiries (
+      id TEXT PRIMARY KEY, property_id TEXT, unit_id INTEGER,
+      name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT DEFAULT '',
+      message TEXT DEFAULT '', status TEXT DEFAULT 'new',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`).catch(()=>{});
     await db.query(
       'INSERT INTO enquiries (id,property_id,unit_id,name,email,phone,message) VALUES ($1,$2,$3,$4,$5,$6,$7)',
       [id, property_id, unit_id||null, name, email, phone||'', message||'']
@@ -918,12 +943,17 @@ async function handleEnquiry(data, res) {
 async function handleGetAdminEnquiries(res) {
   try {
     const r = await db.query(`
-      SELECT e.*, p.title as property_title, p.listing_type FROM enquiries e
+      SELECT e.*, p.title as property_title FROM enquiries e
       LEFT JOIN properties p ON p.id=e.property_id
       ORDER BY e.created_at DESC
     `);
     json(res, 200, { success: true, enquiries: r.rows });
-  } catch(e) { json(res, 500, { error: e.message }); }
+  } catch(e) {
+    // Enquiries table may not exist yet — return empty gracefully
+    if (e.message && (e.message.includes('does not exist') || e.message.includes('relation'))) {
+      json(res, 200, { success: true, enquiries: [], note: 'Run schema.sql to enable enquiries' });
+    } else { json(res, 500, { error: e.message }); }
+  }
 }
 
 // ── SSE endpoint ──
