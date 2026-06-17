@@ -67,14 +67,20 @@ function requireOwner(req, res) {
     return null;
   }
   // Token format: owner:<userId>:<timestamp>
-  // Extract userId (everything between first and last colon-timestamp)
   const parts = token.split(':');
-  if (parts.length < 2) { json(res, 401, { error: 'Invalid token format' }); return null; }
-  // parts[0]='owner', parts[1]=userId (may contain hyphens), parts[last]=timestamp
-  // Remove 'owner' prefix and trailing timestamp
+  if (parts.length < 3) { json(res, 401, { error: 'Invalid token format' }); return null; }
+  // Validate timestamp — reject tokens older than 24 hours
+  const timestamp = parseInt(parts[parts.length - 1]);
+  if (!timestamp || isNaN(timestamp) || Date.now() - timestamp > 24 * 60 * 60 * 1000) {
+    json(res, 401, { error: 'Token expired. Please log in again.' });
+    return null;
+  }
+  // parts[0]='owner', parts[last]=timestamp, middle = userId
   parts.shift(); // remove 'owner'
   parts.pop();   // remove timestamp
-  return parts.join(':'); // rejoin in case userId had colons
+  const userId = parts.join(':');
+  if (!userId || userId.length < 3) { json(res, 401, { error: 'Invalid token' }); return null; }
+  return userId;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -620,7 +626,7 @@ async function handleSavePayment(data, res) {
     await db.query(
       `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-       ON CONFLICT (ref) DO UPDATE SET status=$10, notified=$11, confirmed_at=CASE WHEN $10='confirmed' THEN NOW()::text ELSE confirmed_at END`,
+       ON CONFLICT (ref) DO UPDATE SET status=$10, notified=$11, confirmed_at=CASE WHEN $10='confirmed' THEN NOW()::text ELSE payments.confirmed_at END`,
       [ref, prop||'', buyer||'', phone||'', owner||'', ownerAcct||'', amount||0, fee||0, ownerAmt||0, status||'pending', notified||'', tenancy_id||null]
     );
     await logActivity('Payment ' + (status||'pending') + ': ' + ref);
