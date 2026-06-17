@@ -14,6 +14,18 @@ const http  = require('http');
 const https = require('https');
 const { Pool } = require('pg');
 
+// ── Crash resilience ───────────────────────────────────────────────────────
+// FIX: without these, any single unhandled error anywhere in the app would
+// crash the entire Node process, dropping every open SSE (/events) connection
+// at once — this is the leading suspect for the ERR_CONNECTION_RESET on /events.
+// Render's free-tier cold start/sleep is the other contributor (no code fix for that).
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (process kept alive):', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (process kept alive):', reason);
+});
+
 // ── DB Pool ──────────────────────────────────────────────────────────────────
 process.env.NODE_NO_WARNINGS = "1";
 const db = new Pool({
