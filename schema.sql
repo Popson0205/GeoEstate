@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS enquiries (
   phone           TEXT DEFAULT '',
   message         TEXT DEFAULT '',
   status          TEXT DEFAULT 'new',
+  notes           TEXT DEFAULT '',
+  assigned_to     TEXT DEFAULT '',
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -246,6 +248,10 @@ ALTER TABLE payments ADD COLUMN IF NOT EXISTS tenancy_id INTEGER;
 -- Add notes to disputes
 ALTER TABLE disputes ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT '';
 
+-- Add sales tracking fields to enquiries
+ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT '';
+ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS assigned_to TEXT DEFAULT '';
+
 -- ═══════════════════════════════════════════════════════
 -- INDEXES
 -- ═══════════════════════════════════════════════════════
@@ -260,3 +266,4 @@ CREATE INDEX IF NOT EXISTS idx_property_units_status ON property_units(status);
 CREATE INDEX IF NOT EXISTS idx_tenancies_end_date ON tenancies(end_date);
 CREATE INDEX IF NOT EXISTS idx_tenancies_status ON tenancies(status);
 CREATE INDEX IF NOT EXISTS idx_enquiries_property_id ON enquiries(property_id);
+CREATE INDEX IF NOT EXISTS idx_enquiries_status ON enquiries(status);

@@ -469,6 +469,38 @@ async function handleAdminUpdate(url, data, res) {
     return;
   }
 
+  const enqMatch = url.match(/^\/admin\/enquiry\/([^/]+)$/);
+  if (enqMatch) {
+    const id = enqMatch[1];
+    const { status, notes, assigned_to } = data;
+    try {
+      await db.query(
+        'UPDATE enquiries SET status=COALESCE($1,status), notes=COALESCE($2,notes), assigned_to=COALESCE($3,assigned_to) WHERE id=$4',
+        [status||null, notes||null, assigned_to||null, id]
+      );
+      await logActivity('Enquiry ' + id + ' updated → ' + (status||'no status change'));
+      broadcast('enquiry_updated', { id, status });
+      json(res, 200, { success: true });
+    } catch(e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
+  const enqMatch = url.match(/^\/admin\/enquiry\/([^/]+)$/);
+  if (enqMatch) {
+    const id = enqMatch[1];
+    const { status, notes, assigned_to } = data;
+    try {
+      await db.query(
+        'UPDATE enquiries SET status=COALESCE($1,status), notes=COALESCE($2,notes), assigned_to=COALESCE($3,assigned_to) WHERE id=$4',
+        [status||null, notes||null, assigned_to||null, id]
+      );
+      await logActivity('Enquiry ' + id + ' updated → ' + (status||'no status change'));
+      broadcast('enquiry_updated', { id, status });
+      json(res, 200, { success: true });
+    } catch(e) { json(res, 500, { error: e.message }); }
+    return;
+  }
+
   json(res, 404, { error: 'Unknown admin update endpoint' });
 }
 
@@ -940,8 +972,12 @@ async function handleEnquiry(data, res) {
       id TEXT PRIMARY KEY, property_id TEXT, unit_id INTEGER,
       name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT DEFAULT '',
       message TEXT DEFAULT '', status TEXT DEFAULT 'new',
+      notes TEXT DEFAULT '', assigned_to TEXT DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`).catch(()=>{});
+    // Ensure notes and assigned_to columns exist on older tables
+    await db.query('ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''').catch(()=>{});
+    await db.query('ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS assigned_to TEXT DEFAULT ''').catch(()=>{});
     await db.query(
       'INSERT INTO enquiries (id,property_id,unit_id,name,email,phone,message) VALUES ($1,$2,$3,$4,$5,$6,$7)',
       [id, property_id, unit_id||null, name, email, phone||'', message||'']
@@ -961,7 +997,10 @@ async function handleEnquiry(data, res) {
 async function handleGetAdminEnquiries(res) {
   try {
     const r = await db.query(`
-      SELECT e.*, p.title as property_title FROM enquiries e
+      SELECT e.id, e.property_id, e.unit_id, e.name, e.email, e.phone,
+             e.message, e.status, e.notes, e.assigned_to, e.created_at,
+             p.title as property_title
+      FROM enquiries e
       LEFT JOIN properties p ON p.id=e.property_id
       ORDER BY e.created_at DESC
     `);
@@ -1120,7 +1159,7 @@ const server = http.createServer((req, res) => {
           if (unitAdminAdd) return handleAddUnit(null, unitAdminAdd[1], data, res);
           const unitAdminPatch = url.match(/^\/admin\/property\/([^/]+)\/units\/(\d+)$/);
           if (unitAdminPatch) return handleUpdateUnit(null, unitAdminPatch[1], unitAdminPatch[2], data, res);
-          if (url.startsWith('/admin/registration/') || url.startsWith('/admin/property/') || url.startsWith('/admin/tenancy/'))
+          if (url.startsWith('/admin/registration/') || url.startsWith('/admin/property/') || url.startsWith('/admin/tenancy/') || url.startsWith('/admin/enquiry/'))
             return handleAdminUpdate(url, data, res);
           return json(res, 404, { error: 'Not found' });
         }
