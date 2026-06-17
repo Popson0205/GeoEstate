@@ -485,21 +485,6 @@ async function handleAdminUpdate(url, data, res) {
     return;
   }
 
-  const enqMatch = url.match(/^\/admin\/enquiry\/([^/]+)$/);
-  if (enqMatch) {
-    const id = enqMatch[1];
-    const { status, notes, assigned_to } = data;
-    try {
-      await db.query(
-        'UPDATE enquiries SET status=COALESCE($1,status), notes=COALESCE($2,notes), assigned_to=COALESCE($3,assigned_to) WHERE id=$4',
-        [status||null, notes||null, assigned_to||null, id]
-      );
-      await logActivity('Enquiry ' + id + ' updated → ' + (status||'no status change'));
-      broadcast('enquiry_updated', { id, status });
-      json(res, 200, { success: true });
-    } catch(e) { json(res, 500, { error: e.message }); }
-    return;
-  }
 
   json(res, 404, { error: 'Unknown admin update endpoint' });
 }
@@ -976,8 +961,8 @@ async function handleEnquiry(data, res) {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`).catch(()=>{});
     // Ensure notes and assigned_to columns exist on older tables
-    await db.query('ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''').catch(()=>{});
-    await db.query('ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS assigned_to TEXT DEFAULT ''').catch(()=>{});
+    await db.query("ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''").catch(()=>{});
+    await db.query("ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS assigned_to TEXT DEFAULT ''").catch(()=>{});
     await db.query(
       'INSERT INTO enquiries (id,property_id,unit_id,name,email,phone,message) VALUES ($1,$2,$3,$4,$5,$6,$7)',
       [id, property_id, unit_id||null, name, email, phone||'', message||'']
