@@ -5,7 +5,7 @@
 (function(window) {
   'use strict';
 
-  const GEO_API = 'https://geoestate.onrender.com';
+  const GEO_API = 'https://geoestate-api-clpa.onrender.com';
   const ADMIN_TOKEN_KEY = 'geo_admin_token';
   const OWNER_SESSION_KEY = 'geo_owner_session';
 
