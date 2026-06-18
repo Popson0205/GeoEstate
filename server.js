@@ -300,13 +300,13 @@ async function handlePublicPropertyById(id, res) {
     let prop;
     try {
       const r = await db.query(
-        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,state,lga,address,img,notes,created_at FROM properties WHERE id=$1",
+        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE id=$1",
         [id]
       );
       if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
       prop = r.rows[0];
     } catch(e1) {
-      const r = await db.query("SELECT id,title,owner,type,type as listing_type,status,price,state,lga,address,img,notes,created_at FROM properties WHERE id=$1", [id]);
+      const r = await db.query("SELECT id,title,owner,owner_id,type,type as listing_type,status,price,state,lga,address,img,COALESCE(description,'') as description,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,notes,created_at FROM properties WHERE id=$1", [id]);
       if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
       prop = r.rows[0];
     }
@@ -763,7 +763,7 @@ async function handleOwnerProperties(ownerId, urlFull, res) {
   try {
     const params = new URL('http://x' + urlFull).searchParams;
     const type = params.get('type');
-    let q = "SELECT id,title,owner,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,state,lga,address,img,notes,created_at FROM properties WHERE owner_id=$1";
+    let q = "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE owner_id=$1";
     const args = [ownerId];
     if (type) { args.push(type); q += " AND COALESCE(listing_type,type,'rent')=$" + args.length; }
     q += ' ORDER BY created_at DESC';
@@ -778,7 +778,19 @@ async function handleOwnerProperties(ownerId, urlFull, res) {
       result = await db.query(q2, a2);
     }
     // Add unit counts
-    const rows = result.rows.map(p => ({ ...p, unit_count: 0, vacant_units: 0 }));
+    // Add unit counts from DB
+    let rows = result.rows;
+    try {
+      const ucRes = await db.query(
+        "SELECT property_id, COUNT(*) as unit_count, COUNT(*) FILTER (WHERE status='vacant') as vacant_units FROM property_units WHERE property_id = ANY($1) GROUP BY property_id",
+        [rows.map(r => r.id)]
+      );
+      const ucMap = {};
+      ucRes.rows.forEach(r => { ucMap[r.property_id] = { unit_count: parseInt(r.unit_count)||0, vacant_units: parseInt(r.vacant_units)||0 }; });
+      rows = rows.map(p => ({ ...p, unit_count: (ucMap[p.id]||{}).unit_count||0, vacant_units: (ucMap[p.id]||{}).vacant_units||0 }));
+    } catch(ue) {
+      rows = rows.map(p => ({ ...p, unit_count: 0, vacant_units: 0 }));
+    }
     json(res, 200, { success: true, properties: rows });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
@@ -1041,6 +1053,7 @@ const server = http.createServer((req, res) => {
       if (!requireAdmin(req, res)) return;
       if (url === '/admin/registrations')    return handleGetRegistrations(urlFull, res);
       if (url === '/admin/properties')       return handleGetProperties(res);
+      if (url === '/admin/seed-images')         return handleSeedImages(req, res);
       if (url === '/admin/team')             return handleGetTeam(res);
       if (url === '/admin/lawyers')          return handleGetLawyers(res);
       if (url === '/admin/transactions')     return handleGetTransactions(res);
@@ -1062,6 +1075,8 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/profile')          return handleOwnerProfile(ownerId, res);
       if (url === '/owner/properties')       return handleOwnerProperties(ownerId, urlFull, res);
       if (url === '/owner/enquiries')        return handleOwnerEnquiries(ownerId, res);
+      const propDetailMatch = url.match(/^\/owner\/property\/([^/]+)\/detail$/);
+      if (propDetailMatch) return handleOwnerPropertyDetail(ownerId, propDetailMatch[1], res);
       const unitMatch = url.match(/^\/owner\/property\/([^/]+)\/units$/);
       if (unitMatch)                         return handleGetUnits(ownerId, unitMatch[1], res);
       return json(res, 404, { error: 'Not found' });
@@ -1157,6 +1172,116 @@ const server = http.createServer((req, res) => {
 
   json(res, 405, { error: 'Method not allowed' });
 });
+
+
+
+// ── Owner: Get full property detail ──────────────────────────────────────────
+async function handleOwnerPropertyDetail(ownerId, propId, res) {
+  try {
+    const r = await db.query(
+      `SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,
+       COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,
+       state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,
+       COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,
+       COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at
+       FROM properties WHERE id=$1 AND owner_id=$2`,
+      [propId, ownerId]
+    );
+    if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
+    const prop = r.rows[0];
+    try {
+      const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status FROM property_units WHERE property_id=$1 ORDER BY unit_label", [propId]);
+      prop.units = ur.rows;
+    } catch(e) { prop.units = []; }
+    json(res, 200, { success: true, property: prop });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// ── Admin: Seed real property images and sample data ──────────────────────
+async function handleSeedImages(req, res) {
+  // Real Nigerian property images from Unsplash (free to use)
+  const NIGERIAN_PROPERTY_IMAGES = [
+    'https://images.unsplash.com/photo-1613490493576-7fde63acd811?w=800&q=80',
+    'https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=800&q=80',
+    'https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=800&q=80',
+    'https://images.unsplash.com/photo-1568605114967-8130f3a36994?w=800&q=80',
+    'https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=800&q=80',
+    'https://images.unsplash.com/photo-1560448204-e02f11c3d0e2?w=800&q=80',
+    'https://images.unsplash.com/photo-1512917774080-9991f1c4c750?w=800&q=80',
+    'https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=800&q=80',
+    'https://images.unsplash.com/photo-1583608205776-bfd35f0d9f83?w=800&q=80',
+    'https://images.unsplash.com/photo-1523217582562-09d0def993a6?w=800&q=80',
+    'https://images.unsplash.com/photo-1605276374104-dee2a0ed3cd6?w=800&q=80',
+    'https://images.unsplash.com/photo-1600047509807-ba8f99d2cdde?w=800&q=80',
+    'https://images.unsplash.com/photo-1577495508048-b635879837f1?w=800&q=80',
+  ];
+
+  const IMAGES_GALLERY = [
+    ['https://images.unsplash.com/photo-1613490493576-7fde63acd811?w=800&q=80','https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=800&q=80','https://images.unsplash.com/photo-1560448204-e02f11c3d0e2?w=800&q=80'],
+    ['https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=800&q=80','https://images.unsplash.com/photo-1583608205776-bfd35f0d9f83?w=800&q=80','https://images.unsplash.com/photo-1523217582562-09d0def993a6?w=800&q=80'],
+    ['https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=800&q=80','https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=800&q=80','https://images.unsplash.com/photo-1605276374104-dee2a0ed3cd6?w=800&q=80'],
+    ['https://images.unsplash.com/photo-1568605114967-8130f3a36994?w=800&q=80','https://images.unsplash.com/photo-1512917774080-9991f1c4c750?w=800&q=80','https://images.unsplash.com/photo-1600047509807-ba8f99d2cdde?w=800&q=80'],
+    ['https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=800&q=80','https://images.unsplash.com/photo-1577495508048-b635879837f1?w=800&q=80','https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=800&q=80'],
+  ];
+
+  const SAMPLE_DATA = [
+    { title: '3 Bedroom Flat, Lekki Phase 1', type: 'rent', listing_type: 'rent', price: '₦1,800,000/yr', monthly_rent: 150000, state: 'Lagos', lga: 'Eti-Osa', address: '12 Admiralty Way, Lekki Phase 1, Lagos', bedrooms: 3, bathrooms: 2, size_sqm: 120, description: 'A beautifully finished 3-bedroom flat in the heart of Lekki Phase 1. Features polished granite floors, fitted kitchen, 24/7 security, and dedicated parking. Perfect for families and professionals.', amenities: ['24/7 Security','Fitted Kitchen','Parking','Backup Generator','Water Treatment'] },
+    { title: '5 Bedroom Duplex, Maitama', type: 'rent', listing_type: 'rent', price: '₦6,000,000/yr', monthly_rent: 500000, state: 'FCT Abuja', lga: 'Maitama', address: '7 Adetokunbo Ademola Crescent, Maitama, Abuja', bedrooms: 5, bathrooms: 4, size_sqm: 350, description: 'Executive 5-bedroom detached duplex in Maitama. Staff quarters, swimming pool, spacious compound. Ideal for senior executives and diplomats. Fully serviced option available.', amenities: ['Swimming Pool','Boys Quarters','24/7 Security','Backup Generator','Parking x4','Fitted Kitchen'] },
+    { title: '2 Bedroom Apartment, Victoria Island', type: 'buy', listing_type: 'buy', price: '₦85,000,000', sale_price: 85000000, state: 'Lagos', lga: 'Eti-Osa', address: '4A Ozumba Mbadiwe Avenue, Victoria Island, Lagos', bedrooms: 2, bathrooms: 2, size_sqm: 95, description: 'Modern 2-bedroom luxury apartment on Victoria Island. Sea views from the balcony, concierge service, rooftop pool, and gym. Investment grade property in Lagos financial district.', amenities: ['Gym','Rooftop Pool','Concierge','24/7 Security','Sea View','Backup Generator'] },
+    { title: '4 Bedroom Terrace, Jabi', type: 'rent', listing_type: 'rent', price: '₦3,500,000/yr', monthly_rent: 291667, state: 'FCT Abuja', lga: 'Jabi', address: '22 Jabi Lake Road, Jabi, Abuja', bedrooms: 4, bathrooms: 3, size_sqm: 200, description: 'Spacious 4-bedroom terraced house near Jabi Lake Mall. Well-maintained estate with excellent road network. Great for families with school-age children.', amenities: ['Estate Security','Parking','POP Ceiling','CCTV','Perimeter Fence'] },
+    { title: 'Land (600 sqm) at Ibeju-Lekki', type: 'buy', listing_type: 'buy', price: '₦15,000,000', sale_price: 15000000, state: 'Lagos', lga: 'Ibeju-Lekki', address: 'Eleko Junction, Ibeju-Lekki Free Trade Zone, Lagos', bedrooms: 0, bathrooms: 0, size_sqm: 600, description: 'Prime 600sqm dry land plot at Eleko Junction, Ibeju-Lekki. Gazette survey plan available. Located 3 minutes from Dangote Refinery access road. Rapid value appreciation area.', amenities: ['Gazette Survey','Dry Land','Road Access','LASPOTECH Area','FTZ Proximity'] },
+    { title: '1 Bedroom Mini Flat, Surulere', type: 'rent', listing_type: 'rent', price: '₦650,000/yr', monthly_rent: 54167, state: 'Lagos', lga: 'Surulere', address: '15 Ogunlana Drive, Surulere, Lagos', bedrooms: 1, bathrooms: 1, size_sqm: 45, description: 'Well-maintained 1-bedroom mini flat with tiled floors, wardrobe space, and a functional kitchen. Good transport links — 5 mins walk to Maryland junction. Suitable for young professionals.', amenities: ['Tiled Floors','Wardrobe','Functional Kitchen','Security Door','Water Supply'] },
+    { title: '3 Bedroom Bungalow, Bodija', type: 'lease', listing_type: 'lease', price: '₦2,400,000 lease', lease_price: 2400000, state: 'Oyo', lga: 'Ibadan North', address: '8 Bodija Market Road, Bodija, Ibadan', bedrooms: 3, bathrooms: 2, size_sqm: 130, description: 'Newly renovated 3-bedroom bungalow in the quiet Bodija GRA area of Ibadan. Large compound, fruit trees, separate boys quarters. Ideal for family relocating to Ibadan.', amenities: ['Large Compound','Boys Quarters','Fruit Trees','Pre-paid Meter','Water Well'] },
+    { title: 'Commercial Plaza, Ikeja CBD', type: 'lease', listing_type: 'lease', price: '₦12,000,000/yr lease', lease_price: 12000000, state: 'Lagos', lga: 'Ikeja', address: '45 Allen Avenue, Ikeja, Lagos', bedrooms: 0, bathrooms: 4, size_sqm: 400, description: 'Prime commercial property on Allen Avenue, Ikeja. Ground floor retail plus 2 upper floors of office space. High foot traffic, excellent visibility. Suitable for bank branches, showrooms, or anchor retail.', amenities: ['Lift','Generator','CCTV','Parking Lot','Reception Area','High Foot Traffic'] },
+  ];
+
+  try {
+    const allProps = await db.query('SELECT id FROM properties ORDER BY created_at DESC');
+    const propIds  = allProps.rows.map(r => r.id);
+    let updated = 0;
+
+    for (let i = 0; i < propIds.length; i++) {
+      const sample = SAMPLE_DATA[i % SAMPLE_DATA.length];
+      const imgMain   = NIGERIAN_PROPERTY_IMAGES[i % NIGERIAN_PROPERTY_IMAGES.length];
+      const imgGroup  = IMAGES_GALLERY[i % IMAGES_GALLERY.length];
+
+      try {
+        await db.query(`
+          UPDATE properties SET
+            title=$2, listing_type=$3, type=$3, price=$4,
+            monthly_rent=$5, sale_price=$6, lease_price=$7,
+            state=$8, lga=$9, address=$10,
+            img=$11, images=$12::jsonb,
+            bedrooms=$13, bathrooms=$14, size_sqm=$15,
+            description=$16, amenities=$17::jsonb,
+            updated_at=NOW()
+          WHERE id=$1
+        `, [
+          propIds[i],
+          sample.title + (i >= SAMPLE_DATA.length ? ' ('+i+')' : ''),
+          sample.listing_type,
+          sample.price,
+          sample.monthly_rent || null,
+          sample.sale_price || null,
+          sample.lease_price || null,
+          sample.state, sample.lga, sample.address,
+          imgMain, JSON.stringify(imgGroup),
+          sample.bedrooms, sample.bathrooms, sample.size_sqm,
+          sample.description,
+          JSON.stringify(sample.amenities)
+        ]);
+        updated++;
+      } catch(ue) {
+        // If new columns don't exist, just update img
+        await db.query('UPDATE properties SET img=$2, updated_at=NOW() WHERE id=$1', [propIds[i], imgMain]);
+        updated++;
+      }
+    }
+    json(res, 200, { success: true, message: `Updated ${updated} properties with real images and sample data` });
+  } catch(e) {
+    json(res, 500, { error: e.message });
+  }
+}
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log('✅ GeoEstate API v2.0 running on port ' + PORT));
