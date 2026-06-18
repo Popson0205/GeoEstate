@@ -960,7 +960,7 @@ async function handleAdminGetUnits(propId, res) {
 // ══════════════════════════════════════════════════════════════
 
 async function handleEnquiry(data, res) {
-  const { property_id, name, email, phone, message, unit_id } = data;
+  const { property_id, property_title, name, email, phone, message, unit_id } = data;
   if (!property_id || !name || !email) return json(res, 400, { error: 'property_id, name and email required' });
   const id = 'ENQ-' + Date.now();
   try {
@@ -970,14 +970,22 @@ async function handleEnquiry(data, res) {
       name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT DEFAULT '',
       message TEXT DEFAULT '', status TEXT DEFAULT 'new',
       notes TEXT DEFAULT '', assigned_to TEXT DEFAULT '',
+      property_title TEXT DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`).catch(()=>{});
-    // Ensure notes and assigned_to columns exist on older tables
+    // Ensure all columns exist on older tables
     await db.query("ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''").catch(()=>{});
     await db.query("ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS assigned_to TEXT DEFAULT ''").catch(()=>{});
+    await db.query("ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS property_title TEXT DEFAULT ''").catch(()=>{});
+    // Resolve property title: use submitted title, or look up from DB
+    let resolvedTitle = property_title || '';
+    if (!resolvedTitle) {
+      const tR = await db.query('SELECT title FROM properties WHERE id=$1', [property_id]).catch(()=>({ rows: [] }));
+      resolvedTitle = tR.rows[0]?.title || '';
+    }
     await db.query(
-      'INSERT INTO enquiries (id,property_id,unit_id,name,email,phone,message) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [id, property_id, unit_id||null, name, email, phone||'', message||'']
+      'INSERT INTO enquiries (id,property_id,unit_id,name,email,phone,message,property_title) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [id, property_id, unit_id||null, name, email, phone||'', message||'', resolvedTitle]
     );
     // Notify owner
     const propR = await db.query('SELECT title, owner_id, (SELECT email FROM registrations WHERE id=properties.owner_id) as owner_email FROM properties WHERE id=$1', [property_id]);
@@ -996,7 +1004,7 @@ async function handleGetAdminEnquiries(res) {
     const r = await db.query(`
       SELECT e.id, e.property_id, e.unit_id, e.name, e.email, e.phone,
              e.message, e.status, e.notes, e.assigned_to, e.created_at,
-             p.title as property_title
+             COALESCE(NULLIF(e.property_title,''), p.title, e.property_id) as property_title
       FROM enquiries e
       LEFT JOIN properties p ON p.id=e.property_id
       ORDER BY e.created_at DESC
