@@ -214,6 +214,17 @@ CREATE TABLE IF NOT EXISTS activity_log (
   logged_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- PHASE 5: OTP codes — moved out of in-process memory so they survive
+-- across serverless invocations (Vercel does not guarantee the same
+-- instance handles /send-otp and the later /verify-otp request).
+CREATE TABLE IF NOT EXISTS otp_codes (
+  key             TEXT PRIMARY KEY,
+  code            TEXT NOT NULL,
+  expires         TIMESTAMPTZ NOT NULL,
+  attempts        INTEGER DEFAULT 0,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ═══════════════════════════════════════════════════════
 -- MIGRATION STATEMENTS (safe to run on existing DB)
 -- ═══════════════════════════════════════════════════════
@@ -267,3 +278,4 @@ CREATE INDEX IF NOT EXISTS idx_tenancies_end_date ON tenancies(end_date);
 CREATE INDEX IF NOT EXISTS idx_tenancies_status ON tenancies(status);
 CREATE INDEX IF NOT EXISTS idx_enquiries_property_id ON enquiries(property_id);
 CREATE INDEX IF NOT EXISTS idx_enquiries_status ON enquiries(status);
+CREATE INDEX IF NOT EXISTS idx_otp_codes_expires ON otp_codes(expires);

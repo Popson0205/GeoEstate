@@ -37,10 +37,49 @@ const db = new Pool({
 const RESEND_API_KEY = process.env.SECRET_RESEND_API_KEY;
 const ADMIN_SECRET   = process.env.ADMIN_SECRET || 'geoestate-admin-2024';
 const FROM_EMAIL     = 'GeoEstate <noreply@geoestate.com.ng>';
-const otpStore       = {};
 const sseClients     = new Set(); // for Server-Sent Events
 
+// ── OTP store (Postgres-backed) ──────────────────────────────────────────────
+// NOTE: previously an in-memory object. On Vercel each request can be served
+// by a different, isolated serverless instance, so anything kept only in
+// process memory (set in one invocation) is invisible to the next invocation.
+// That made /verify-otp fail with "No code found" even with the correct code,
+// since the user types the code in after the /send-otp instance had already
+// gone away. Storing in Postgres makes it durable across instances.
+async function otpSet(key, code, ttlMs) {
+  const expires = new Date(Date.now() + ttlMs);
+  await db.query(
+    `INSERT INTO otp_codes (key, code, expires, attempts)
+     VALUES ($1,$2,$3,0)
+     ON CONFLICT (key) DO UPDATE SET code=$2, expires=$3, attempts=0, created_at=NOW()`,
+    [key, code, expires]
+  );
+}
+
+async function otpGet(key) {
+  const r = await db.query('SELECT code, expires, attempts FROM otp_codes WHERE key=$1', [key]);
+  if (!r.rows.length) return null;
+  const row = r.rows[0];
+  return { code: row.code, expires: new Date(row.expires).getTime(), attempts: row.attempts };
+}
+
+async function otpIncrementAttempts(key) {
+  await db.query('UPDATE otp_codes SET attempts = attempts + 1 WHERE key=$1', [key]);
+}
+
+async function otpDelete(key) {
+  await db.query('DELETE FROM otp_codes WHERE key=$1', [key]);
+}
+
 // ── SSE Broadcast ─────────────────────────────────────────────────────────────
+// LIMITATION on Vercel: sseClients only holds connections handled by *this*
+// serverless instance. A write from one instance (e.g. an admin saving a
+// property) cannot reach a browser whose /events connection landed on a
+// different instance — there's no shared memory between them. The frontend's
+// 5s auto-reconnect (geo-api.js) keeps the connection alive in practice, but
+// true cross-client real-time push isn't guaranteed the way it was on Render's
+// single always-on process. A managed pub/sub (e.g. Pusher/Ably) or polling
+// would be needed for guaranteed real-time sync on serverless hosting.
 function broadcast(eventName, data) {
   const msg = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const client of sseClients) {
@@ -206,8 +245,8 @@ async function handleSendOTP(data, res) {
   const { email, name, purpose } = data;
   if (!email || !email.includes('@')) return json(res, 400, { error: 'Valid email required' });
   const code = generateOTP();
-  otpStore[email.toLowerCase()] = { code, expires: Date.now() + 10 * 60 * 1000, attempts: 0 };
   try {
+    await otpSet(email.toLowerCase(), code, 10 * 60 * 1000);
     await sendEmail(email, 'GeoEstate — Your Code: ' + code, otpEmail(code, name || '', purpose || 'register'));
     json(res, 200, { success: true, message: 'Code sent to ' + email });
   } catch(e) {
@@ -219,14 +258,21 @@ async function handleSendOTP(data, res) {
 async function handleVerifyOTP(data, res) {
   const { email, code } = data;
   if (!email || !code) return json(res, 400, { error: 'Email and code required' });
-  const record = otpStore[email.toLowerCase()];
-  if (!record) return json(res, 400, { error: 'No code found. Request a new one.' });
-  if (Date.now() > record.expires) { delete otpStore[email.toLowerCase()]; return json(res, 400, { error: 'Code expired.' }); }
-  record.attempts++;
-  if (record.attempts > 5) { delete otpStore[email.toLowerCase()]; return json(res, 429, { error: 'Too many attempts. Request a new code.' }); }
-  if (code !== record.code) return json(res, 400, { error: 'Incorrect code. ' + (5 - record.attempts) + ' attempt(s) remaining.' });
-  delete otpStore[email.toLowerCase()];
-  json(res, 200, { success: true, message: 'Email verified' });
+  try {
+    const key = email.toLowerCase();
+    const record = await otpGet(key);
+    if (!record) return json(res, 400, { error: 'No code found. Request a new one.' });
+    if (Date.now() > record.expires) { await otpDelete(key); return json(res, 400, { error: 'Code expired.' }); }
+    if (record.attempts > 5) { await otpDelete(key); return json(res, 429, { error: 'Too many attempts. Request a new code.' }); }
+    if (code !== record.code) {
+      await otpIncrementAttempts(key);
+      return json(res, 400, { error: 'Incorrect code. ' + (5 - record.attempts - 1) + ' attempt(s) remaining.' });
+    }
+    await otpDelete(key);
+    json(res, 200, { success: true, message: 'Email verified' });
+  } catch(e) {
+    json(res, 500, { error: e.message });
+  }
 }
 
 async function handleRegister(data, res) {
@@ -689,24 +735,25 @@ async function handleSaveTransaction(data, res) {
 async function handleOwnerLogin(data, res) {
   const { email, code } = data;
   if (!email) return json(res, 400, { error: 'Email required' });
+  const key = 'owner:' + email.toLowerCase();
 
   // If just requesting OTP
   if (!code) {
     const otpCode = generateOTP();
-    otpStore['owner:' + email.toLowerCase()] = { code: otpCode, expires: Date.now() + 10 * 60 * 1000, attempts: 0 };
     try {
+      await otpSet(key, otpCode, 10 * 60 * 1000);
       await sendEmail(email, 'GeoEstate Owner Login — Code: ' + otpCode, otpEmail(otpCode, '', 'owner-login'));
       return json(res, 200, { success: true, message: 'Code sent' });
     } catch(e) { return json(res, 500, { error: e.message }); }
   }
 
   // Verify OTP
-  const record = otpStore['owner:' + email.toLowerCase()];
+  let record;
+  try { record = await otpGet(key); } catch(e) { return json(res, 500, { error: e.message }); }
   if (!record) return json(res, 400, { error: 'No code found. Request a new one.' });
-  if (Date.now() > record.expires) { delete otpStore['owner:' + email.toLowerCase()]; return json(res, 400, { error: 'Code expired.' }); }
-  record.attempts++;
-  if (code !== record.code) return json(res, 400, { error: 'Incorrect code.' });
-  delete otpStore['owner:' + email.toLowerCase()];
+  if (Date.now() > record.expires) { await otpDelete(key); return json(res, 400, { error: 'Code expired.' }); }
+  if (code !== record.code) { await otpIncrementAttempts(key); return json(res, 400, { error: 'Incorrect code.' }); }
+  await otpDelete(key);
 
   // Find user — accept any registered email, owner role not strictly required
   try {
