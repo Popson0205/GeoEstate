@@ -36,6 +36,24 @@ const db = new Pool({
 // ── Config ───────────────────────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.SECRET_RESEND_API_KEY;
 const ADMIN_SECRET   = process.env.ADMIN_SECRET || 'geoestate-admin-2024';
+
+// ── Sales Team Config ──────────────────────────────────────────────────────
+const SALES_TEAM = [
+  {
+    name:      'Majekodunmi Lateefat',
+    title:     'Sales Manager',
+    email:     'mlateefat95@gmail.com',
+    phone:     '+2348133343645',
+    whatsapp:  '2348133343645'
+  },
+  {
+    name:      'Adesina Faridat Adenike',
+    title:     'Sales Manager',
+    email:     'faridat3008@gmail.com',
+    phone:     '+2349131916831',
+    whatsapp:  '2349131916831'
+  }
+];
 const FROM_EMAIL     = 'GeoEstate <noreply@geoestate.com.ng>';
 const sseClients     = new Set(); // for Server-Sent Events
 
@@ -228,6 +246,48 @@ function enquiryEmail(enq, property) {
     <tr><td style="padding:6px 12px;color:#6b7280">Phone</td><td style="padding:6px 12px">${enq.phone || '—'}</td></tr>
     <tr><td style="padding:6px 12px;color:#6b7280">Message</td><td style="padding:6px 12px">${enq.message || '—'}</td></tr>
   </table>
+</td></tr>
+</table></td></tr></table></body></html>`;
+}
+
+// ── Sales alert email template ───────────────────────────────────────────────
+function salesAlertEmail(enq, propertyTitle, salesPerson) {
+  const waMsg = encodeURIComponent(
+    'Hi ' + enq.name + ', I\'m ' + salesPerson.name + ' from GeoEstate. I saw your enquiry about "' + propertyTitle + '". I\'d love to help you. When is a good time to talk?'
+  );
+  const waLink = 'https://wa.me/' + enq.phone.replace(/[^0-9]/g,'') + '?text=' + waMsg;
+  const waLinkSelf = 'https://wa.me/' + salesPerson.whatsapp + '?text=' + encodeURIComponent('New lead: ' + enq.name + ' (' + enq.phone + ') enquired about "' + propertyTitle + '"');
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 20px"><tr><td align="center">
+<table width="100%" style="max-width:540px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08)">
+<tr><td style="background:linear-gradient(135deg,#0d3d22,#1a6b3c);padding:24px 32px">
+  <div style="color:#fff;font-size:20px;font-weight:800">🔔 New Property Enquiry</div>
+  <div style="color:rgba(255,255,255,.7);font-size:13px;margin-top:4px">Action required — respond within 1 hour</div>
+</td></tr>
+<tr><td style="padding:28px 32px">
+  <div style="background:#f0fdf4;border-radius:10px;padding:16px;margin-bottom:20px">
+    <div style="font-size:12px;color:#6b7280;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Property</div>
+    <div style="font-size:16px;font-weight:800;color:#0d3d22">${propertyTitle}</div>
+  </div>
+  <div style="background:#f9fafb;border-radius:10px;padding:16px;margin-bottom:20px">
+    <div style="font-size:12px;color:#6b7280;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px">Lead Details</div>
+    <table style="width:100%;font-size:14px;border-collapse:collapse">
+      <tr><td style="padding:5px 0;color:#6b7280;width:80px">Name</td><td style="padding:5px 0;font-weight:700">${enq.name}</td></tr>
+      <tr><td style="padding:5px 0;color:#6b7280">Email</td><td style="padding:5px 0">${enq.email}</td></tr>
+      <tr><td style="padding:5px 0;color:#6b7280">Phone</td><td style="padding:5px 0;font-weight:700">${enq.phone || '—'}</td></tr>
+      <tr><td style="padding:5px 0;color:#6b7280">Message</td><td style="padding:5px 0;font-style:italic">${enq.message || '—'}</td></tr>
+    </table>
+  </div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
+    <a href="${waLink}" style="display:inline-block;background:#25D366;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:700;font-size:14px">💬 WhatsApp Lead</a>
+    <a href="tel:${enq.phone}" style="display:inline-block;background:#1a6b3c;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:700;font-size:14px">📞 Call Lead</a>
+    <a href="mailto:${enq.email}" style="display:inline-block;background:#f3f4f6;color:#111;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:700;font-size:14px">✉️ Email Lead</a>
+  </div>
+  <div style="font-size:12px;color:#9ca3af;border-top:1px solid #f3f4f6;padding-top:16px">
+    This alert was sent to you as ${salesPerson.name} (${salesPerson.title}) on the GeoEstate Sales Team.<br>
+    Log into the <a href="https://www.geoestate.com.ng" style="color:#1a6b3c">GeoEstate Admin Dashboard</a> to manage this enquiry.
+  </div>
 </td></tr>
 </table></td></tr></table></body></html>`;
 }
@@ -1036,13 +1096,27 @@ async function handleEnquiry(data, res) {
     );
     // Notify owner
     const propR = await db.query('SELECT title, owner_id, (SELECT email FROM registrations WHERE id=properties.owner_id) as owner_email FROM properties WHERE id=$1', [property_id]);
+    const propTitle = propR.rows[0]?.title || resolvedTitle || property_title || 'Property';
     if (propR.rows[0]?.owner_email) {
-      sendEmail(propR.rows[0].owner_email, '📬 New Enquiry: ' + propR.rows[0].title, enquiryEmail({name,email,phone,message}, propR.rows[0].title))
+      sendEmail(propR.rows[0].owner_email, '📬 New Enquiry: ' + propTitle, enquiryEmail({name,email,phone,message}, propTitle))
         .catch(e => console.warn('Enquiry email failed:', e.message));
+    }
+    // Notify all sales team members instantly
+    for (const sm of SALES_TEAM) {
+      sendEmail(
+        sm.email,
+        '🔔 New Lead: ' + name + ' — ' + propTitle,
+        salesAlertEmail({name, email, phone: phone||'—', message: message||''}, propTitle, sm)
+      ).catch(e => console.warn('Sales alert email failed for ' + sm.email + ':', e.message));
     }
     await logActivity('Enquiry received for property ' + property_id + ' from ' + name);
     broadcast('new_enquiry', { property_id, name });
-    json(res, 200, { success: true, enquiryId: id });
+    // Return sales contact info to frontend
+    json(res, 200, {
+      success: true,
+      enquiryId: id,
+      salesTeam: SALES_TEAM.map(s => ({ name: s.name, title: s.title, phone: s.phone, whatsapp: s.whatsapp, email: s.email }))
+    });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
