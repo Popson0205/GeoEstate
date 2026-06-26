@@ -753,8 +753,18 @@ async function handleSubmitDispute(data, res) {
 async function handleUpdateDispute(id, data, res) {
   const { status, lawyerAssigned, npfFiled, notes } = data;
   try {
-    await db.query('UPDATE disputes SET status=$1, lawyer_assigned=$2, npf_filed=$3, notes=COALESCE($4,notes) WHERE id=$5',
-      [status||'active', lawyerAssigned||'', npfFiled||false, notes||null, id]);
+    // Try full update first, fall back without notes column if missing
+    try {
+      await db.query('UPDATE disputes SET status=$1, lawyer_assigned=$2, npf_filed=$3, notes=COALESCE($4,notes) WHERE id=$5',
+        [status||'active', lawyerAssigned||'', npfFiled||false, notes||null, id]);
+    } catch(e1) {
+      if (e1.message && e1.message.includes('notes')) {
+        // Add notes column then retry
+        await db.query("ALTER TABLE disputes ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''");
+        await db.query('UPDATE disputes SET status=$1, lawyer_assigned=$2, npf_filed=$3 WHERE id=$4',
+          [status||'active', lawyerAssigned||'', npfFiled||false, id]);
+      } else { throw e1; }
+    }
     await logActivity('Dispute updated: ' + id + ' -> ' + status);
     json(res, 200, { success: true });
   } catch(e) { json(res, 500, { error: e.message }); }
@@ -1251,6 +1261,7 @@ const server = http.createServer((req, res) => {
       if (url === '/admin/disputes')         return handleGetDisputes(res);
       if (url === '/admin/payments')         return handleGetPayments(res);
       if (url === '/admin/sync')             return handleGetSync(res);
+      if (url === '/admin/purge-test-data')    return handleAdminPurge({}, res);
       if (url === '/admin/enquiries')        return handleGetAdminEnquiries(res);
       const unitAdminMatch = url.match(/^\/admin\/property\/([^/]+)\/units$/);
       if (unitAdminMatch)                    return handleAdminGetUnits(unitAdminMatch[1], res);
@@ -1337,6 +1348,7 @@ const server = http.createServer((req, res) => {
           if (url !== '/submit-property' && !requireAdmin(req, res)) return;
           if (url === '/submit-property')           return handleSaveProperty(data, res);
           if (url === '/admin/seed-properties')      return handleSeedProperties(req, res);
+          if (url === '/admin/purge-test-data')        return handleAdminPurge(data, res);
           if (url === '/admin/save-property')       return handleSaveProperty(data, res);
           if (url === '/admin/create-property')     return handleSaveProperty(data, res);
           if (url === '/admin/save-lawyer')         return handleSaveLawyer(data, res);
@@ -1651,6 +1663,31 @@ async function handleSeedProperties(req, res) {
   } catch(e) {
     json(res, 500, { error: e.message });
   }
+}
+
+
+// ── Admin: Hard purge all test/seed/junk data ─────────────────────────────
+async function handleAdminPurge(data, res) {
+  try {
+    const results = {};
+    // Delete test disputes
+    const dr = await db.query("DELETE FROM disputes WHERE title ILIKE 'Test Dispute%' OR title ILIKE 'Test%' RETURNING id");
+    results.disputes_deleted = dr.rowCount;
+    // Delete test enquiries (E2E + Test Visitor + closed test ones)
+    const er = await db.query("DELETE FROM enquiries WHERE name ILIKE '%E2E%' OR name ILIKE 'Test%' OR name ILIKE 'Test User' OR status='closed' RETURNING id");
+    results.enquiries_deleted = er.rowCount;
+    // Hard delete rejected properties
+    const pr = await db.query("DELETE FROM properties WHERE status='rejected' RETURNING id");
+    results.properties_deleted = pr.rowCount;
+    // Hard delete E2E/test registrations
+    const rr = await db.query("DELETE FROM registrations WHERE id ILIKE '%E2E%' OR email ILIKE '%e2etest%' RETURNING id");
+    results.registrations_deleted = rr.rowCount;
+    // Delete the duplicate Idris renter account
+    const dup = await db.query("DELETE FROM registrations WHERE email='akansiology122@gmail.com' RETURNING id");
+    results.duplicate_accounts_deleted = dup.rowCount;
+    await logActivity('Admin purge executed: ' + JSON.stringify(results));
+    json(res, 200, { success: true, purged: results });
+  } catch(e) { json(res, 500, { error: e.message }); }
 }
 
 const PORT = process.env.PORT || 3001;
