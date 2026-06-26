@@ -1449,7 +1449,9 @@ async function handleCloudinarySign(data, res) {
   const tags      = data.tags   || 'geoestate,registration';
 
   // Build the string-to-sign (Cloudinary v2 signature)
-  const toSign = `folder=${folder}&tags=${tags}&timestamp=${timestamp}${API_SECRET}`;
+  // IMPORTANT: Only sign the params we actually send in the upload FormData.
+  // Including tags here without sending them in the upload causes 401 Invalid Signature.
+  const toSign = `folder=${folder}&timestamp=${timestamp}${API_SECRET}`;
   const signature = crypto.createHash('sha1').update(toSign).digest('hex');
 
   json(res, 200, {
@@ -1458,7 +1460,8 @@ async function handleCloudinarySign(data, res) {
     api_key: API_KEY,
     cloud_name: CLOUD_NAME,
     folder,
-    tags
+    tags,
+    tags_in_signature: false   // tells frontend: do NOT append tags to FormData
   });
 }
 
