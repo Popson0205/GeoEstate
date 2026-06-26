@@ -356,9 +356,57 @@ async function handleVerifyOTP(data, res) {
   }
 }
 
+
+// ── User Login — POST /user/login ────────────────────────────────────────────
+// Validates email + password against registrations table in Neon.
+// Password is stored as base64(password) in the reg payload (same as frontend btoa).
+// Returns the user record on success.
+async function handleUserLogin(data, res) {
+  const { email, password } = data;
+  if (!email || !password) return json(res, 400, { error: 'Email and password required' });
+  try {
+    const r = await db.query(
+      'SELECT id, fname, lname, email, phone, role, status, is_verified, pass_hash FROM registrations WHERE email = $1',
+      [email.toLowerCase().trim()]
+    );
+    if (!r.rows.length) return json(res, 401, { error: 'No account found with this email. Please register first.' });
+    const user = r.rows[0];
+    // Password stored as btoa(password) by frontend — compare base64
+    const expected = Buffer.from(password).toString('base64');
+    if (user.pass_hash) {
+      if (user.pass_hash !== expected) {
+        return json(res, 401, { error: 'Incorrect password. Please try again.' });
+      }
+    } else {
+      // No password stored yet — accept login and save hash for next time
+      await db.query(
+        'UPDATE registrations SET pass_hash = $1, updated_at = NOW() WHERE id = $2',
+        [expected, user.id]
+      ).catch(e => console.warn('pass_hash update failed:', e.message));
+    }
+    json(res, 200, {
+      success: true,
+      user: {
+        id:       user.id,
+        fname:    user.fname,
+        lname:    user.lname,
+        email:    user.email,
+        phone:    user.phone,
+        role:     user.role,
+        verified: user.is_verified || false
+      }
+    });
+  } catch(e) {
+    console.error('User login error:', e.message);
+    json(res, 500, { error: 'Login failed. Please try again.' });
+  }
+}
+
 async function handleRegister(data, res) {
   const { fname, lname, email, phone, role, id, registeredAt } = data;
   if (!email || !fname) return json(res, 400, { error: 'Name and email required' });
+  // pass is sent as btoa(password) from frontend doRegister()
+  const pass_hash = data.pass || null;
   const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
   try {
     const exists = await db.query('SELECT id FROM registrations WHERE email = $1', [email.toLowerCase()]);
@@ -368,15 +416,15 @@ async function handleRegister(data, res) {
     try {
       const { photo_url, id_doc_url, other_doc_url } = data;
       await db.query(
-        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone,photo_url,id_doc_url,other_doc_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone,photo_url,id_doc_url,other_doc_url,pass_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
         [subId, fname, lname, email.toLowerCase(), phone||'', role||'renter', role||'renter',
          new Date().toLocaleString('en-NG'), registeredAt||new Date().toISOString(),
          (fname[0]||'')+(lname[0]||''),
          dob||'—', gender||'—', occupation||'—', employer||'—',
          regState||'—', regLga||'—', regAddress||'—',
          next_of_kin||'—', next_of_kin_rel||'—', next_of_kin_phone||'—',
-         photo_url||null, id_doc_url||null, other_doc_url||null]
+         photo_url||null, id_doc_url||null, other_doc_url||null, pass_hash||null]
       );
     } catch(e1) {
       // Fallback: minimal insert if extended columns missing
@@ -1351,6 +1399,7 @@ const server = http.createServer((req, res) => {
         if (url === '/send-otp')             return handleSendOTP(data, res);
         if (url === '/verify-otp')           return handleVerifyOTP(data, res);
         if (url === '/register')             return handleRegister(data, res);
+        if (url === '/user/login')            return handleUserLogin(data, res);
         if (url === '/enquiry')              return handleEnquiry(data, res);
         if (url === '/upload-sign')           return handleCloudinarySign(data, res);
         if (url === '/submit-dispute')       return handleSubmitDispute(data, res);
@@ -1448,9 +1497,9 @@ async function handleCloudinarySign(data, res) {
   const folder    = data.folder || 'geoestate/registrations';
   const tags      = data.tags   || 'geoestate,registration';
 
-  // Build the string-to-sign (Cloudinary v2 signature)
-  // IMPORTANT: Only sign the params we actually send in the upload FormData.
-  // Including tags here without sending them in the upload causes 401 Invalid Signature.
+  // Build the string-to-sign — Cloudinary v2 requires ONLY the params
+  // that are actually included in the upload FormData, sorted alphabetically.
+  // Tags are NOT sent in the FormData so they must NOT be in the signature.
   const toSign = `folder=${folder}&timestamp=${timestamp}${API_SECRET}`;
   const signature = crypto.createHash('sha1').update(toSign).digest('hex');
 
@@ -1460,8 +1509,8 @@ async function handleCloudinarySign(data, res) {
     api_key: API_KEY,
     cloud_name: CLOUD_NAME,
     folder,
-    tags,
-    tags_in_signature: false   // tells frontend: do NOT append tags to FormData
+    tags,              // returned for reference but NOT part of signature
+    tags_in_signature: false
   });
 }
 
