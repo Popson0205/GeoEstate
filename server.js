@@ -339,15 +339,17 @@ async function handleRegister(data, res) {
     const subId = id || ('USR-' + Date.now());
     // Try full insert with all extended fields, fall back to minimal
     try {
+      const { photo_url, id_doc_url, other_doc_url } = data;
       await db.query(
-        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone,photo_url,id_doc_url,other_doc_url)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
         [subId, fname, lname, email.toLowerCase(), phone||'', role||'renter', role||'renter',
          new Date().toLocaleString('en-NG'), registeredAt||new Date().toISOString(),
          (fname[0]||'')+(lname[0]||''),
          dob||'—', gender||'—', occupation||'—', employer||'—',
          regState||'—', regLga||'—', regAddress||'—',
-         next_of_kin||'—', next_of_kin_rel||'—', next_of_kin_phone||'—']
+         next_of_kin||'—', next_of_kin_rel||'—', next_of_kin_phone||'—',
+         photo_url||null, id_doc_url||null, other_doc_url||null]
       );
     } catch(e1) {
       // Fallback: minimal insert if extended columns missing
@@ -1391,6 +1393,45 @@ async function handleOwnerPropertyDetail(ownerId, propId, res) {
     json(res, 200, { success: true, property: prop });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
+
+// ── Cloudinary: Generate signed upload parameters ──────────────────────────
+// Browser calls POST /upload-sign → gets back signed params
+// → Browser uploads DIRECTLY to Cloudinary (no file bytes hit this server)
+// → Cloudinary returns secure_url → browser saves URL in reg payload
+async function handleCloudinarySign(req, res) {
+  const CLOUD_NAME   = process.env.CLOUDINARY_CLOUD_NAME;
+  const API_KEY      = process.env.CLOUDINARY_API_KEY;
+  const API_SECRET   = process.env.CLOUDINARY_API_SECRET;
+
+  if (!CLOUD_NAME || !API_KEY || !API_SECRET) {
+    return json(res, 503, { error: 'Image uploads not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Railway.' });
+  }
+
+  // Read request body to get folder/tag hints
+  let body = '';
+  await new Promise(resolve => { req.on('data', d => body += d); req.on('end', resolve); });
+  let data = {};
+  try { data = JSON.parse(body); } catch(e) {}
+
+  const crypto = require('crypto');
+  const timestamp = Math.round(Date.now() / 1000);
+  const folder    = data.folder || 'geoestate/registrations';
+  const tags      = data.tags   || 'geoestate,registration';
+
+  // Build the string-to-sign (Cloudinary v2 signature)
+  const toSign = `folder=${folder}&tags=${tags}&timestamp=${timestamp}${API_SECRET}`;
+  const signature = crypto.createHash('sha1').update(toSign).digest('hex');
+
+  json(res, 200, {
+    signature,
+    timestamp,
+    api_key: API_KEY,
+    cloud_name: CLOUD_NAME,
+    folder,
+    tags
+  });
+}
+
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log('✅ GeoEstate API v2.0 running on port ' + PORT));
