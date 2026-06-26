@@ -338,17 +338,33 @@ async function handleVerifyOTP(data, res) {
 async function handleRegister(data, res) {
   const { fname, lname, email, phone, role, id, registeredAt } = data;
   if (!email || !fname) return json(res, 400, { error: 'Name and email required' });
+  const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
   try {
     const exists = await db.query('SELECT id FROM registrations WHERE email = $1', [email.toLowerCase()]);
     if (exists.rows.length) return json(res, 200, { success: true, message: 'Already registered' });
     const subId = id || ('USR-' + Date.now());
-    await db.query(
-      `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10)`,
-      [subId, fname, lname, email.toLowerCase(), phone||'', role||'renter', role||'renter',
-       new Date().toLocaleString('en-NG'), registeredAt||new Date().toISOString(),
-       (fname[0]||'')+(lname[0]||'')]
-    );
+    // Try full insert with all extended fields, fall back to minimal
+    try {
+      await db.query(
+        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+        [subId, fname, lname, email.toLowerCase(), phone||'', role||'renter', role||'renter',
+         new Date().toLocaleString('en-NG'), registeredAt||new Date().toISOString(),
+         (fname[0]||'')+(lname[0]||''),
+         dob||'—', gender||'—', occupation||'—', employer||'—',
+         regState||'—', regLga||'—', regAddress||'—',
+         next_of_kin||'—', next_of_kin_rel||'—', next_of_kin_phone||'—']
+      );
+    } catch(e1) {
+      // Fallback: minimal insert if extended columns missing
+      await db.query(
+        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10)`,
+        [subId, fname, lname, email.toLowerCase(), phone||'', role||'renter', role||'renter',
+         new Date().toLocaleString('en-NG'), registeredAt||new Date().toISOString(),
+         (fname[0]||'')+(lname[0]||'')]
+      );
+    }
     await logActivity('New registration: ' + fname + ' ' + lname + ' (' + (role==='owner'?'Owner':'Renter') + ')');
     sendEmail('admin@geoestate.com.ng', '🆕 New Registration: ' + fname + ' ' + lname, adminAlertEmail({fname,lname,email,phone,role,id:subId}))
       .catch(e => console.warn('Admin alert failed:', e.message));
@@ -535,7 +551,16 @@ async function handleAdminUpdate(url, data, res) {
       );
       // If approved as owner, ensure owner capability
       if (status === 'approved') {
-        await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
+        try {
+          await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
+        } catch(verifyErr) {
+          // is_verified column may not exist yet — add it and retry
+          try {
+            await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE");
+            await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS owner_since TIMESTAMPTZ");
+            await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
+          } catch(e2) { console.warn('is_verified column fix failed:', e2.message); }
+        }
       }
       await logActivity('Registration ' + status + ': ' + id);
       broadcast('registration_updated', { id, status });
@@ -856,11 +881,36 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
     const r = await db.query('SELECT is_verified FROM registrations WHERE id=$1', [ownerId]);
     if (r.rows[0]?.is_verified) return json(res, 200, { success: true, alreadyVerified: true, message: 'Already verified — no action needed.' });
 
-    const { nin, doc_type, doc_url, selfie_url } = data;
-    await db.query(
-      'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, updated_at=NOW() WHERE id=$4',
-      [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId]
-    );
+    const { nin, doc_type, doc_url, selfie_url, dob, gender, occupation, employer, state, lga, address, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
+    // Try full update with all fields, fall back to minimal if columns missing
+    try {
+      await db.query(
+        `UPDATE registrations SET
+          nin=$1, doc=$2, is_verified=false, status=$3,
+          dob=COALESCE(NULLIF($5,''),dob),
+          gender=COALESCE(NULLIF($6,''),gender),
+          occupation=COALESCE(NULLIF($7,''),occupation),
+          employer=COALESCE(NULLIF($8,''),employer),
+          state=COALESCE(NULLIF($9,''),state),
+          lga=COALESCE(NULLIF($10,''),lga),
+          address=COALESCE(NULLIF($11,''),address),
+          next_of_kin=COALESCE(NULLIF($12,''),next_of_kin),
+          next_of_kin_rel=COALESCE(NULLIF($13,''),next_of_kin_rel),
+          next_of_kin_phone=COALESCE(NULLIF($14,''),next_of_kin_phone),
+          updated_at=NOW()
+        WHERE id=$4`,
+        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId,
+         dob||'', gender||'', occupation||'', employer||'',
+         state||'', lga||'', address||'',
+         next_of_kin||'', next_of_kin_rel||'', next_of_kin_phone||'']
+      );
+    } catch(e) {
+      // Fallback: minimal update if extended columns don't exist
+      await db.query(
+        'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, updated_at=NOW() WHERE id=$4',
+        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId]
+      );
+    }
     await logActivity('Owner identity submitted for review: ' + ownerId);
     json(res, 200, { success: true, message: 'Identity submitted. You will be notified once verified (usually within 24 hours).' });
   } catch(e) { json(res, 500, { error: e.message }); }
@@ -905,9 +955,19 @@ async function handleOwnerProperties(ownerId, urlFull, res) {
 
 async function handleOwnerAddProperty(ownerId, data, res) {
   // Check verification
-  const vr = await db.query('SELECT is_verified, status FROM registrations WHERE id=$1', [ownerId]);
-  if (!vr.rows.length) return json(res, 404, { error: 'Owner not found' });
-  if (!vr.rows[0].is_verified) return json(res, 403, {
+  let vrRow;
+  try {
+    const vr = await db.query('SELECT is_verified, status FROM registrations WHERE id=$1', [ownerId]);
+    if (!vr.rows.length) return json(res, 404, { error: 'Owner not found' });
+    vrRow = vr.rows[0];
+  } catch(e) {
+    // Fallback if is_verified column missing — check status only
+    const vr2 = await db.query('SELECT status FROM registrations WHERE id=$1', [ownerId]);
+    if (!vr2.rows.length) return json(res, 404, { error: 'Owner not found' });
+    vrRow = { is_verified: vr2.rows[0].status === 'approved', status: vr2.rows[0].status };
+  }
+  // Allow listing if verified OR if admin has approved the account
+  if (!vrRow.is_verified && vrRow.status !== 'approved') return json(res, 403, {
     error: 'Identity not yet verified',
     needsVerification: true,
     message: 'Please complete identity verification to list properties. You only need to do this once.'
