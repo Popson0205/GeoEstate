@@ -32,8 +32,34 @@ const db = new Pool({
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.SECRET_RESEND_API_KEY;
-const ADMIN_SECRET   = process.env.ADMIN_SECRET; // ← Set this in Railway environment variables
-if (!ADMIN_SECRET) { console.error('FATAL: ADMIN_SECRET env var is not set. Set it in Railway before deploying.'); process.exit(1); }
+// ── Admin Auth Config ────────────────────────────────────────────────────────
+const ADMIN_EMAIL    = process.env.ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const JWT_SECRET     = process.env.JWT_SECRET;
+if (!ADMIN_EMAIL || !ADMIN_PASSWORD || !JWT_SECRET) {
+  console.error('FATAL: ADMIN_EMAIL, ADMIN_PASSWORD, and JWT_SECRET must all be set in Railway environment variables.');
+  process.exit(1);
+}
+
+// ── Minimal HS256 JWT (no external deps) ─────────────────────────────────────
+const crypto = require('crypto');
+function b64url(buf) { return buf.toString('base64').replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_'); }
+function jwtSign(payload, secret, expiresInHours = 8) {
+  const header  = b64url(Buffer.from(JSON.stringify({ alg:'HS256', typ:'JWT' })));
+  const body    = b64url(Buffer.from(JSON.stringify({ ...payload, iat: Math.floor(Date.now()/1000), exp: Math.floor(Date.now()/1000) + expiresInHours * 3600 })));
+  const sig     = b64url(crypto.createHmac('sha256', secret).update(header + '.' + body).digest());
+  return header + '.' + body + '.' + sig;
+}
+function jwtVerify(token, secret) {
+  try {
+    const [header, body, sig] = token.split('.');
+    const expected = b64url(crypto.createHmac('sha256', secret).update(header + '.' + body).digest());
+    if (sig !== expected) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64').toString());
+    if (payload.exp < Math.floor(Date.now()/1000)) return null; // expired
+    return payload;
+  } catch(e) { return null; }
+}
 
 // ── Sales Team Config ──────────────────────────────────────────────────────
 const SALES_TEAM = [
@@ -101,13 +127,14 @@ function broadcast(eventName, data) {
 
 // ── Auth Middleware ───────────────────────────────────────────────────────────
 function requireAdmin(req, res) {
-  const auth = req.headers['authorization'] || req.headers['x-admin-token'] || '';
-  const token = auth.replace('Bearer ', '').trim();
-  if (token !== ADMIN_SECRET) {
-    json(res, 401, { error: 'Unauthorized' });
+  const auth  = req.headers['authorization'] || req.headers['x-admin-token'] || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  const payload = jwtVerify(token, JWT_SECRET);
+  if (!payload || payload.role !== 'admin') {
+    json(res, 401, { error: 'Unauthorized — please log in again' });
     return false;
   }
-  return true;
+  return payload;
 }
 
 function requireOwner(req, res) {
@@ -1248,6 +1275,11 @@ const server = http.createServer((req, res) => {
     // Admin routes — require token
     if (url.startsWith('/admin/')) {
       if (!requireAdmin(req, res)) return;
+      if (url === '/admin/me') {
+        const payload = requireAdmin(req, res);
+        if (!payload) return;
+        return json(res, 200, { success: true, email: payload.email, role: payload.role });
+      }
       if (url === '/admin/registrations')    return handleGetRegistrations(urlFull, res);
       if (url === '/admin/properties')       return handleGetProperties(res);
       if (url === '/admin/team')             return handleGetTeam(res);
@@ -1314,11 +1346,13 @@ const server = http.createServer((req, res) => {
         const data = body ? JSON.parse(body) : {};
 
         // Public endpoints
+        if (url === '/admin/login')            return handleAdminLogin(data, res);
+        if (url === '/admin/logout')           return handleAdminLogout(req, res);
         if (url === '/send-otp')             return handleSendOTP(data, res);
         if (url === '/verify-otp')           return handleVerifyOTP(data, res);
         if (url === '/register')             return handleRegister(data, res);
         if (url === '/enquiry')              return handleEnquiry(data, res);
-        if (url === '/upload-sign')           return handleCloudinarySign(req, res);
+        if (url === '/upload-sign')           return handleCloudinarySign(data, res);
         if (url === '/submit-dispute')       return handleSubmitDispute(data, res);
 
         // Owner auth (no token needed)
@@ -1398,7 +1432,7 @@ async function handleOwnerPropertyDetail(ownerId, propId, res) {
 // Browser calls POST /upload-sign → gets back signed params
 // → Browser uploads DIRECTLY to Cloudinary (no file bytes hit this server)
 // → Cloudinary returns secure_url → browser saves URL in reg payload
-async function handleCloudinarySign(req, res) {
+async function handleCloudinarySign(data, res) {
   const CLOUD_NAME   = process.env.CLOUDINARY_CLOUD_NAME;
   const API_KEY      = process.env.CLOUDINARY_API_KEY;
   const API_SECRET   = process.env.CLOUDINARY_API_SECRET;
@@ -1407,11 +1441,7 @@ async function handleCloudinarySign(req, res) {
     return json(res, 503, { error: 'Image uploads not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Railway.' });
   }
 
-  // Read request body to get folder/tag hints
-  let body = '';
-  await new Promise(resolve => { req.on('data', d => body += d); req.on('end', resolve); });
-  let data = {};
-  try { data = JSON.parse(body); } catch(e) {}
+  // data is passed directly from the outer body parser
 
   const crypto = require('crypto');
   const timestamp = Math.round(Date.now() / 1000);
@@ -1430,6 +1460,36 @@ async function handleCloudinarySign(req, res) {
     folder,
     tags
   });
+}
+
+
+// ── Admin Login — POST /admin/login ──────────────────────────────────────────
+// Validates ADMIN_EMAIL + ADMIN_PASSWORD env vars, returns a signed JWT.
+// The raw password/secret NEVER leaves the server.
+async function handleAdminLogin(data, res) {
+  const { email, password } = data;
+  if (!email || !password) return json(res, 400, { error: 'Email and password required' });
+
+  // Constant-time comparison to prevent timing attacks
+  const emailOk    = crypto.timingSafeEqual(Buffer.from(email.toLowerCase().trim()), Buffer.from(ADMIN_EMAIL.toLowerCase().trim()));
+  const passwordOk = crypto.timingSafeEqual(Buffer.from(password), Buffer.from(ADMIN_PASSWORD));
+
+  if (!emailOk || !passwordOk) {
+    await new Promise(r => setTimeout(r, 500)); // slow down brute force
+    return json(res, 401, { error: 'Invalid email or password' });
+  }
+
+  const token = jwtSign({ role: 'admin', email: ADMIN_EMAIL }, JWT_SECRET, 8);
+  await logActivity('Admin login: ' + ADMIN_EMAIL).catch(() => {});
+  json(res, 200, { success: true, token, expiresIn: '8h' });
+}
+
+// ── Admin Logout — POST /admin/logout ────────────────────────────────────────
+// Stateless JWT — logout is handled client-side by deleting the token.
+// This endpoint exists for audit logging purposes.
+async function handleAdminLogout(req, res) {
+  await logActivity('Admin logout').catch(() => {});
+  json(res, 200, { success: true });
 }
 
 

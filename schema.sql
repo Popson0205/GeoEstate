@@ -279,3 +279,17 @@ CREATE INDEX IF NOT EXISTS idx_tenancies_status ON tenancies(status);
 CREATE INDEX IF NOT EXISTS idx_enquiries_property_id ON enquiries(property_id);
 CREATE INDEX IF NOT EXISTS idx_enquiries_status ON enquiries(status);
 CREATE INDEX IF NOT EXISTS idx_otp_codes_expires ON otp_codes(expires);
+
+-- ═══════════════════════════════════════════════════════
+-- ADMIN AUTH (added June 2026)
+-- ═══════════════════════════════════════════════════════
+
+-- Admin session log (audit trail — JWT is stateless but we log logins)
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  id          SERIAL PRIMARY KEY,
+  email       TEXT NOT NULL,
+  action      TEXT NOT NULL DEFAULT 'login', -- 'login' | 'logout'
+  ip          TEXT,
+  user_agent  TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
