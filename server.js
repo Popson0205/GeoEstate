@@ -15,10 +15,7 @@ const https = require('https');
 const { Pool } = require('pg');
 
 // ── Crash resilience ───────────────────────────────────────────────────────
-// FIX: without these, any single unhandled error anywhere in the app would
-// crash the entire Node process, dropping every open SSE (/events) connection
-// at once — this is the leading suspect for the ERR_CONNECTION_RESET on /events.
-// Render's free-tier cold start/sleep is the other contributor (no code fix for that).
+// Crash resilience — keep process alive on unhandled errors.
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception (process kept alive):', err);
 });
@@ -35,7 +32,8 @@ const db = new Pool({
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.SECRET_RESEND_API_KEY;
-const ADMIN_SECRET   = process.env.ADMIN_SECRET || 'geoestate-admin-2024';
+const ADMIN_SECRET   = process.env.ADMIN_SECRET; // ← Set this in Railway environment variables
+if (!ADMIN_SECRET) { console.error('FATAL: ADMIN_SECRET env var is not set. Set it in Railway before deploying.'); process.exit(1); }
 
 // ── Sales Team Config ──────────────────────────────────────────────────────
 const SALES_TEAM = [
@@ -58,11 +56,7 @@ const FROM_EMAIL     = 'GeoEstate <noreply@geoestate.com.ng>';
 const sseClients     = new Set(); // for Server-Sent Events
 
 // ── OTP store (Postgres-backed) ──────────────────────────────────────────────
-// NOTE: previously an in-memory object. On Vercel each request can be served
-// by a different, isolated serverless instance, so anything kept only in
-// process memory (set in one invocation) is invisible to the next invocation.
-// That made /verify-otp fail with "No code found" even with the correct code,
-// since the user types the code in after the /send-otp instance had already
+// NOTE: OTP codes are stored in Postgres so they survive service restarts.
 // gone away. Storing in Postgres makes it durable across instances.
 async function otpSet(key, code, ttlMs) {
   const expires = new Date(Date.now() + ttlMs);
@@ -90,12 +84,12 @@ async function otpDelete(key) {
 }
 
 // ── SSE Broadcast ─────────────────────────────────────────────────────────────
-// LIMITATION on Vercel: sseClients only holds connections handled by *this*
+// NOTE: sseClients is per-process. Multiple Railway replicas = use Railway's
 // serverless instance. A write from one instance (e.g. an admin saving a
 // property) cannot reach a browser whose /events connection landed on a
 // different instance — there's no shared memory between them. The frontend's
 // 5s auto-reconnect (geo-api.js) keeps the connection alive in practice, but
-// true cross-client real-time push isn't guaranteed the way it was on Render's
+// Redis pub/sub for true fan-out. Single replica works fine for launch.
 // single always-on process. A managed pub/sub (e.g. Pusher/Ably) or polling
 // would be needed for guaranteed real-time sync on serverless hosting.
 function broadcast(eventName, data) {
@@ -1241,6 +1235,8 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET') {
     if (url === '/')
       return db.query('SELECT COUNT(*) FROM registrations').then(r => json(res,200,{status:'ok',service:'GeoEstate API',version:'2.0',db:'neon',registrations:r.rows[0].count})).catch(()=>json(res,200,{status:'ok',service:'GeoEstate API',version:'2.0'}));
+    if (url === '/health') return json(res, 200, { status: 'ok', service: 'GeoEstate API', version: '2.0' });
+
 
     // Public — no auth required
     if (url === '/properties')               return handlePublicProperties(urlFull, res);
@@ -1252,7 +1248,6 @@ const server = http.createServer((req, res) => {
       if (!requireAdmin(req, res)) return;
       if (url === '/admin/registrations')    return handleGetRegistrations(urlFull, res);
       if (url === '/admin/properties')       return handleGetProperties(res);
-      if (url === '/admin/seed-images')         return handleSeedImages(req, res);
       if (url === '/admin/team')             return handleGetTeam(res);
       if (url === '/admin/lawyers')          return handleGetLawyers(res);
       if (url === '/admin/transactions')     return handleGetTransactions(res);
@@ -1261,7 +1256,6 @@ const server = http.createServer((req, res) => {
       if (url === '/admin/disputes')         return handleGetDisputes(res);
       if (url === '/admin/payments')         return handleGetPayments(res);
       if (url === '/admin/sync')             return handleGetSync(res);
-      if (url === '/admin/purge-test-data')    return handleAdminPurge({}, res);
       if (url === '/admin/enquiries')        return handleGetAdminEnquiries(res);
       const unitAdminMatch = url.match(/^\/admin\/property\/([^/]+)\/units$/);
       if (unitAdminMatch)                    return handleAdminGetUnits(unitAdminMatch[1], res);
@@ -1347,8 +1341,6 @@ const server = http.createServer((req, res) => {
         if (url.startsWith('/admin/') || url === '/submit-property') {
           if (url !== '/submit-property' && !requireAdmin(req, res)) return;
           if (url === '/submit-property')           return handleSaveProperty(data, res);
-          if (url === '/admin/seed-properties')      return handleSeedProperties(req, res);
-          if (url === '/admin/purge-test-data')        return handleAdminPurge(data, res);
           if (url === '/admin/save-property')       return handleSaveProperty(data, res);
           if (url === '/admin/create-property')     return handleSaveProperty(data, res);
           if (url === '/admin/save-lawyer')         return handleSaveLawyer(data, res);
@@ -1397,296 +1389,6 @@ async function handleOwnerPropertyDetail(ownerId, propId, res) {
       prop.units = ur.rows;
     } catch(e) { prop.units = []; }
     json(res, 200, { success: true, property: prop });
-  } catch(e) { json(res, 500, { error: e.message }); }
-}
-
-// ── Admin: Seed real property images and sample data ──────────────────────
-async function handleSeedImages(req, res) {
-  // Real Nigerian property images from Unsplash (free to use)
-  const NIGERIAN_PROPERTY_IMAGES = [
-    'https://images.unsplash.com/photo-1613490493576-7fde63acd811?w=800&q=80',
-    'https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=800&q=80',
-    'https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=800&q=80',
-    'https://images.unsplash.com/photo-1568605114967-8130f3a36994?w=800&q=80',
-    'https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=800&q=80',
-    'https://images.unsplash.com/photo-1560448204-e02f11c3d0e2?w=800&q=80',
-    'https://images.unsplash.com/photo-1512917774080-9991f1c4c750?w=800&q=80',
-    'https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=800&q=80',
-    'https://images.unsplash.com/photo-1583608205776-bfd35f0d9f83?w=800&q=80',
-    'https://images.unsplash.com/photo-1523217582562-09d0def993a6?w=800&q=80',
-    'https://images.unsplash.com/photo-1605276374104-dee2a0ed3cd6?w=800&q=80',
-    'https://images.unsplash.com/photo-1600047509807-ba8f99d2cdde?w=800&q=80',
-    'https://images.unsplash.com/photo-1577495508048-b635879837f1?w=800&q=80',
-  ];
-
-  const IMAGES_GALLERY = [
-    ['https://images.unsplash.com/photo-1613490493576-7fde63acd811?w=800&q=80','https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=800&q=80','https://images.unsplash.com/photo-1560448204-e02f11c3d0e2?w=800&q=80'],
-    ['https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=800&q=80','https://images.unsplash.com/photo-1583608205776-bfd35f0d9f83?w=800&q=80','https://images.unsplash.com/photo-1523217582562-09d0def993a6?w=800&q=80'],
-    ['https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=800&q=80','https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=800&q=80','https://images.unsplash.com/photo-1605276374104-dee2a0ed3cd6?w=800&q=80'],
-    ['https://images.unsplash.com/photo-1568605114967-8130f3a36994?w=800&q=80','https://images.unsplash.com/photo-1512917774080-9991f1c4c750?w=800&q=80','https://images.unsplash.com/photo-1600047509807-ba8f99d2cdde?w=800&q=80'],
-    ['https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=800&q=80','https://images.unsplash.com/photo-1577495508048-b635879837f1?w=800&q=80','https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=800&q=80'],
-  ];
-
-  const SAMPLE_DATA = [
-    { title: '3 Bedroom Flat, Lekki Phase 1', type: 'rent', listing_type: 'rent', price: '₦1,800,000/yr', monthly_rent: 150000, state: 'Lagos', lga: 'Eti-Osa', address: '12 Admiralty Way, Lekki Phase 1, Lagos', bedrooms: 3, bathrooms: 2, size_sqm: 120, description: 'A beautifully finished 3-bedroom flat in the heart of Lekki Phase 1. Features polished granite floors, fitted kitchen, 24/7 security, and dedicated parking. Perfect for families and professionals.', amenities: ['24/7 Security','Fitted Kitchen','Parking','Backup Generator','Water Treatment'] },
-    { title: '5 Bedroom Duplex, Maitama', type: 'rent', listing_type: 'rent', price: '₦6,000,000/yr', monthly_rent: 500000, state: 'FCT Abuja', lga: 'Maitama', address: '7 Adetokunbo Ademola Crescent, Maitama, Abuja', bedrooms: 5, bathrooms: 4, size_sqm: 350, description: 'Executive 5-bedroom detached duplex in Maitama. Staff quarters, swimming pool, spacious compound. Ideal for senior executives and diplomats. Fully serviced option available.', amenities: ['Swimming Pool','Boys Quarters','24/7 Security','Backup Generator','Parking x4','Fitted Kitchen'] },
-    { title: '2 Bedroom Apartment, Victoria Island', type: 'buy', listing_type: 'buy', price: '₦85,000,000', sale_price: 85000000, state: 'Lagos', lga: 'Eti-Osa', address: '4A Ozumba Mbadiwe Avenue, Victoria Island, Lagos', bedrooms: 2, bathrooms: 2, size_sqm: 95, description: 'Modern 2-bedroom luxury apartment on Victoria Island. Sea views from the balcony, concierge service, rooftop pool, and gym. Investment grade property in Lagos financial district.', amenities: ['Gym','Rooftop Pool','Concierge','24/7 Security','Sea View','Backup Generator'] },
-    { title: '4 Bedroom Terrace, Jabi', type: 'rent', listing_type: 'rent', price: '₦3,500,000/yr', monthly_rent: 291667, state: 'FCT Abuja', lga: 'Jabi', address: '22 Jabi Lake Road, Jabi, Abuja', bedrooms: 4, bathrooms: 3, size_sqm: 200, description: 'Spacious 4-bedroom terraced house near Jabi Lake Mall. Well-maintained estate with excellent road network. Great for families with school-age children.', amenities: ['Estate Security','Parking','POP Ceiling','CCTV','Perimeter Fence'] },
-    { title: 'Land (600 sqm) at Ibeju-Lekki', type: 'buy', listing_type: 'buy', price: '₦15,000,000', sale_price: 15000000, state: 'Lagos', lga: 'Ibeju-Lekki', address: 'Eleko Junction, Ibeju-Lekki Free Trade Zone, Lagos', bedrooms: 0, bathrooms: 0, size_sqm: 600, description: 'Prime 600sqm dry land plot at Eleko Junction, Ibeju-Lekki. Gazette survey plan available. Located 3 minutes from Dangote Refinery access road. Rapid value appreciation area.', amenities: ['Gazette Survey','Dry Land','Road Access','LASPOTECH Area','FTZ Proximity'] },
-    { title: '1 Bedroom Mini Flat, Surulere', type: 'rent', listing_type: 'rent', price: '₦650,000/yr', monthly_rent: 54167, state: 'Lagos', lga: 'Surulere', address: '15 Ogunlana Drive, Surulere, Lagos', bedrooms: 1, bathrooms: 1, size_sqm: 45, description: 'Well-maintained 1-bedroom mini flat with tiled floors, wardrobe space, and a functional kitchen. Good transport links — 5 mins walk to Maryland junction. Suitable for young professionals.', amenities: ['Tiled Floors','Wardrobe','Functional Kitchen','Security Door','Water Supply'] },
-    { title: '3 Bedroom Bungalow, Bodija', type: 'lease', listing_type: 'lease', price: '₦2,400,000 lease', lease_price: 2400000, state: 'Oyo', lga: 'Ibadan North', address: '8 Bodija Market Road, Bodija, Ibadan', bedrooms: 3, bathrooms: 2, size_sqm: 130, description: 'Newly renovated 3-bedroom bungalow in the quiet Bodija GRA area of Ibadan. Large compound, fruit trees, separate boys quarters. Ideal for family relocating to Ibadan.', amenities: ['Large Compound','Boys Quarters','Fruit Trees','Pre-paid Meter','Water Well'] },
-    { title: 'Commercial Plaza, Ikeja CBD', type: 'lease', listing_type: 'lease', price: '₦12,000,000/yr lease', lease_price: 12000000, state: 'Lagos', lga: 'Ikeja', address: '45 Allen Avenue, Ikeja, Lagos', bedrooms: 0, bathrooms: 4, size_sqm: 400, description: 'Prime commercial property on Allen Avenue, Ikeja. Ground floor retail plus 2 upper floors of office space. High foot traffic, excellent visibility. Suitable for bank branches, showrooms, or anchor retail.', amenities: ['Lift','Generator','CCTV','Parking Lot','Reception Area','High Foot Traffic'] },
-  ];
-
-  try {
-    const allProps = await db.query('SELECT id FROM properties ORDER BY created_at DESC');
-    const propIds  = allProps.rows.map(r => r.id);
-    let updated = 0;
-
-    for (let i = 0; i < propIds.length; i++) {
-      const sample = SAMPLE_DATA[i % SAMPLE_DATA.length];
-      const imgMain   = NIGERIAN_PROPERTY_IMAGES[i % NIGERIAN_PROPERTY_IMAGES.length];
-      const imgGroup  = IMAGES_GALLERY[i % IMAGES_GALLERY.length];
-
-      try {
-        await db.query(`
-          UPDATE properties SET
-            title=$2, listing_type=$3, type=$3, price=$4,
-            monthly_rent=$5, sale_price=$6, lease_price=$7,
-            state=$8, lga=$9, address=$10,
-            img=$11, images=$12::jsonb,
-            bedrooms=$13, bathrooms=$14, size_sqm=$15,
-            description=$16, amenities=$17::jsonb,
-            updated_at=NOW()
-          WHERE id=$1
-        `, [
-          propIds[i],
-          sample.title + (i >= SAMPLE_DATA.length ? ' ('+i+')' : ''),
-          sample.listing_type,
-          sample.price,
-          sample.monthly_rent || null,
-          sample.sale_price || null,
-          sample.lease_price || null,
-          sample.state, sample.lga, sample.address,
-          imgMain, JSON.stringify(imgGroup),
-          sample.bedrooms, sample.bathrooms, sample.size_sqm,
-          sample.description,
-          JSON.stringify(sample.amenities)
-        ]);
-        updated++;
-      } catch(ue) {
-        // If new columns don't exist, just update img
-        await db.query('UPDATE properties SET img=$2, updated_at=NOW() WHERE id=$1', [propIds[i], imgMain]);
-        updated++;
-      }
-    }
-    json(res, 200, { success: true, message: `Updated ${updated} properties with real images and sample data` });
-  } catch(e) {
-    json(res, 500, { error: e.message });
-  }
-}
-
-
-// ── Cloudinary Image Upload ────────────────────────────────────────────────
-// Required env vars on Render: CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
-const crypto = require('crypto');
-
-function cloudinarySign(params, apiSecret) {
-  // Sort params alphabetically, join as key=value&key=value, append secret, SHA1
-  const str = Object.keys(params).sort()
-    .map(k => k + '=' + params[k])
-    .join('&') + apiSecret;
-  return crypto.createHash('sha1').update(str).digest('hex');
-}
-
-async function handleCloudinarySign(req, res) {
-  // Returns a signed upload preset so the browser can upload directly to Cloudinary
-  // Browser sends: POST /upload-sign  { folder: "geoestate/properties" }
-  const CLOUD_NAME  = process.env.CLOUDINARY_CLOUD_NAME;
-  const API_KEY     = process.env.CLOUDINARY_API_KEY;
-  const API_SECRET  = process.env.CLOUDINARY_API_SECRET;
-
-  if (!CLOUD_NAME || !API_KEY || !API_SECRET) {
-    return json(res, 503, { error: 'Cloudinary not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET on Render.' });
-  }
-
-  let body = '';
-  await new Promise(resolve => { req.on('data', c => body += c); req.on('end', resolve); });
-  let data = {};
-  try { data = JSON.parse(body); } catch(e) {}
-
-  const timestamp = Math.round(Date.now() / 1000);
-  const folder    = data.folder || 'geoestate/properties';
-  const params    = { folder, timestamp };
-  const signature = cloudinarySign(params, API_SECRET);
-
-  json(res, 200, {
-    signature,
-    timestamp,
-    folder,
-    api_key: API_KEY,
-    cloud_name: CLOUD_NAME,
-    upload_url: `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/image/upload`
-  });
-}
-
-
-// ── Admin: Wipe all properties and seed with real test data ──────────────────
-async function handleSeedProperties(req, res) {
-  const PROPS = [
-    {
-      id: 'SEED-001', title: '3 Bedroom Flat, Lekki Phase 1',
-      listing_type: 'rent', type: 'rent', status: 'live',
-      price: '₦1,800,000/yr', monthly_rent: 150000,
-      state: 'Lagos', lga: 'Eti-Osa', address: '12 Admiralty Way, Lekki Phase 1, Lagos',
-      owner: 'Chukwuemeka Obi',
-      img: 'https://images.unsplash.com/photo-1613490493576-7fde63acd811?w=900&q=80',
-      images: JSON.stringify(['https://images.unsplash.com/photo-1613490493576-7fde63acd811?w=900&q=80','https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=900&q=80','https://images.unsplash.com/photo-1560448204-e02f11c3d0e2?w=900&q=80']),
-      bedrooms: 3, bathrooms: 2, size_sqm: 120,
-      description: 'A beautifully finished 3-bedroom flat in the heart of Lekki Phase 1. Polished granite floors, fitted kitchen with modern cabinets, 24/7 security with CCTV, and dedicated parking for 2 cars. Water treatment plant serving the entire estate. Perfect for families and young professionals.',
-      amenities: JSON.stringify(['24/7 Security','CCTV','Fitted Kitchen','Parking x2','Backup Generator','Water Treatment','POP Ceiling','Pre-paid Meter'])
-    },
-    {
-      id: 'SEED-002', title: '5 Bedroom Duplex, Maitama',
-      listing_type: 'rent', type: 'rent', status: 'live',
-      price: '₦6,000,000/yr', monthly_rent: 500000,
-      state: 'FCT Abuja', lga: 'Maitama', address: '7 Adetokunbo Ademola Crescent, Maitama, Abuja',
-      owner: 'Ngozi Adeyemi',
-      img: 'https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=900&q=80',
-      images: JSON.stringify(['https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=900&q=80','https://images.unsplash.com/photo-1600585154340-be6161a56a0c?w=900&q=80','https://images.unsplash.com/photo-1583608205776-bfd35f0d9f83?w=900&q=80']),
-      bedrooms: 5, bathrooms: 4, size_sqm: 350,
-      description: 'Executive 5-bedroom detached duplex in the prestigious Maitama district of Abuja. Features staff quarters, a private swimming pool, 4-car garage, and a large landscaped garden. Ideal for senior executives, diplomats, and high-net-worth individuals. Fully-serviced option available.',
-      amenities: JSON.stringify(['Swimming Pool','Boys Quarters','24/7 Security','Backup Generator','Parking x4','Fitted Kitchen','CCTV','Smart Home System'])
-    },
-    {
-      id: 'SEED-003', title: '2 Bedroom Luxury Apartment, Victoria Island',
-      listing_type: 'buy', type: 'buy', status: 'live',
-      price: '₦85,000,000', sale_price: 85000000,
-      state: 'Lagos', lga: 'Eti-Osa', address: '4A Ozumba Mbadiwe Avenue, Victoria Island, Lagos',
-      owner: 'Fatima Bello',
-      img: 'https://images.unsplash.com/photo-1512917774080-9991f1c4c750?w=900&q=80',
-      images: JSON.stringify(['https://images.unsplash.com/photo-1512917774080-9991f1c4c750?w=900&q=80','https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=900&q=80','https://images.unsplash.com/photo-1523217582562-09d0def993a6?w=900&q=80']),
-      bedrooms: 2, bathrooms: 2, size_sqm: 95,
-      description: 'Modern 2-bedroom luxury apartment on Victoria Island with partial Atlantic Ocean views from the private balcony. Building features a rooftop pool, fully-equipped gym, 24/7 concierge, and basement parking. Investment-grade property in the Lagos financial district. Title documents: Certificate of Occupancy.',
-      amenities: JSON.stringify(['Rooftop Pool','Gym','Concierge','24/7 Security','Ocean View','Backup Generator','Basement Parking','Elevator'])
-    },
-    {
-      id: 'SEED-004', title: '4 Bedroom Terrace House, Jabi',
-      listing_type: 'rent', type: 'rent', status: 'live',
-      price: '₦3,500,000/yr', monthly_rent: 291667,
-      state: 'FCT Abuja', lga: 'Jabi', address: '22 Jabi Lake Road, Jabi, Abuja',
-      owner: 'Tunde Adesanya',
-      img: 'https://images.unsplash.com/photo-1568605114967-8130f3a36994?w=900&q=80',
-      images: JSON.stringify(['https://images.unsplash.com/photo-1568605114967-8130f3a36994?w=900&q=80','https://images.unsplash.com/photo-1605276374104-dee2a0ed3cd6?w=900&q=80','https://images.unsplash.com/photo-1600047509807-ba8f99d2cdde?w=900&q=80']),
-      bedrooms: 4, bathrooms: 3, size_sqm: 200,
-      description: 'Spacious 4-bedroom terraced house in a gated estate near Jabi Lake Mall and the Jabi Bus Terminal. Well-maintained with excellent road network. Good schools and shopping within walking distance. Great for families with school-age children relocating to Abuja.',
-      amenities: JSON.stringify(['Estate Security','CCTV','Parking','POP Ceiling','Perimeter Fence','Pre-paid Meter','Water Borehole'])
-    },
-    {
-      id: 'SEED-005', title: 'Prime Land 600sqm, Ibeju-Lekki',
-      listing_type: 'buy', type: 'buy', status: 'live',
-      price: '₦15,000,000', sale_price: 15000000,
-      state: 'Lagos', lga: 'Ibeju-Lekki', address: 'Eleko Junction, Ibeju-Lekki Free Trade Zone, Lagos',
-      owner: 'Amaka Okonkwo',
-      img: 'https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=900&q=80',
-      images: JSON.stringify(['https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=900&q=80','https://images.unsplash.com/photo-1577495508048-b635879837f1?w=900&q=80','https://images.unsplash.com/photo-1560448204-e02f11c3d0e2?w=900&q=80']),
-      bedrooms: 0, bathrooms: 0, size_sqm: 600,
-      description: 'Prime 600sqm dry land plot at Eleko Junction, Ibeju-Lekki. Located 3 minutes from the Dangote Refinery access road in the Lagos Free Trade Zone corridor. Gazette survey plan available. Rapid value appreciation area — prices have tripled in the last 3 years.',
-      amenities: JSON.stringify(['Gazette Survey Plan','Dry Land','Road Frontage','FTZ Proximity','Dangote Corridor','Perimeter Beacons Set'])
-    },
-    {
-      id: 'SEED-006', title: '1 Bedroom Mini Flat, Surulere',
-      listing_type: 'rent', type: 'rent', status: 'live',
-      price: '₦650,000/yr', monthly_rent: 54167,
-      state: 'Lagos', lga: 'Surulere', address: '15 Ogunlana Drive, Surulere, Lagos',
-      owner: 'Segun Lawal',
-      img: 'https://images.unsplash.com/photo-1583608205776-bfd35f0d9f83?w=900&q=80',
-      images: JSON.stringify(['https://images.unsplash.com/photo-1583608205776-bfd35f0d9f83?w=900&q=80','https://images.unsplash.com/photo-1523217582562-09d0def993a6?w=900&q=80','https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=900&q=80']),
-      bedrooms: 1, bathrooms: 1, size_sqm: 45,
-      description: 'Well-maintained 1-bedroom mini flat on Ogunlana Drive, Surulere. Tiled floors throughout, built-in wardrobe, and a functional kitchen with wall cabinet. Strong water pressure, reliable PHCN supply in this area. 5 minutes walk to Maryland/Surulere junction. Ideal for young professionals and students.',
-      amenities: JSON.stringify(['Tiled Floors','Wardrobe','Security Door','Wall Tiles','Water Supply','Good PHCN Supply'])
-    },
-    {
-      id: 'SEED-007', title: '3 Bedroom Bungalow, Bodija GRA',
-      listing_type: 'lease', type: 'lease', status: 'live',
-      price: '₦2,400,000 lease', lease_price: 2400000,
-      state: 'Oyo', lga: 'Ibadan North', address: '8 Bodija Market Road, Bodija GRA, Ibadan',
-      owner: 'Kemi Adebayo',
-      img: 'https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=900&q=80',
-      images: JSON.stringify(['https://images.unsplash.com/photo-1570129477492-45c003dc2d06?w=900&q=80','https://images.unsplash.com/photo-1605276374104-dee2a0ed3cd6?w=900&q=80','https://images.unsplash.com/photo-1613490493576-7fde63acd811?w=900&q=80']),
-      bedrooms: 3, bathrooms: 2, size_sqm: 130,
-      description: 'Newly renovated 3-bedroom bungalow in the quiet Bodija GRA area of Ibadan. Large compound with fruit trees, a separate boys quarters, and a carport. Freshly painted, new tiles, and replaced plumbing. Ideal for a family relocating to Ibadan. Close to UI and Bodija International Market.',
-      amenities: JSON.stringify(['Large Compound','Boys Quarters','Fruit Trees','Pre-paid Meter','Water Well','New Tiles','Carport'])
-    },
-    {
-      id: 'SEED-008', title: 'Commercial Plaza, Allen Avenue, Ikeja',
-      listing_type: 'lease', type: 'lease', status: 'live',
-      price: '₦12,000,000/yr lease', lease_price: 12000000,
-      state: 'Lagos', lga: 'Ikeja', address: '45 Allen Avenue, Ikeja, Lagos',
-      owner: 'Babatunde Fashola',
-      img: 'https://images.unsplash.com/photo-1600047509807-ba8f99d2cdde?w=900&q=80',
-      images: JSON.stringify(['https://images.unsplash.com/photo-1600047509807-ba8f99d2cdde?w=900&q=80','https://images.unsplash.com/photo-1523217582562-09d0def993a6?w=900&q=80','https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=900&q=80']),
-      bedrooms: 0, bathrooms: 4, size_sqm: 400,
-      description: 'Prime commercial property on Allen Avenue, Ikeja — one of the busiest commercial streets in Lagos. Ground floor retail space plus 2 upper floors of open-plan office space. Dedicated lift, full generator backup, CCTV, and a private car park for 15 vehicles. Suitable for bank branches, showrooms, telecoms offices, or anchor retail.',
-      amenities: JSON.stringify(['Lift','Full Generator','CCTV','Parking x15','Reception Area','High Foot Traffic','Allen Ave Frontage','3-Phase Power'])
-    }
-  ];
-
-  try {
-    // Wipe all existing properties and units
-    await db.query('DELETE FROM property_units');
-    await db.query('DELETE FROM properties');
-
-    // Insert seed data
-    for (const p of PROPS) {
-      await db.query(`
-        INSERT INTO properties (
-          id, title, owner, listing_type, type, status, price,
-          monthly_rent, sale_price, lease_price,
-          state, lga, address,
-          img, images, bedrooms, bathrooms, size_sqm,
-          description, amenities, submitted, created_at, updated_at
-        ) VALUES (
-          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17,$18,$19,$20::jsonb,$21,NOW(),NOW()
-        )`,
-        [
-          p.id, p.title, p.owner||'', p.listing_type, p.type, p.status, p.price,
-          p.monthly_rent||null, p.sale_price||null, p.lease_price||null,
-          p.state, p.lga, p.address,
-          p.img, p.images, p.bedrooms||null, p.bathrooms||null, p.size_sqm||null,
-          p.description, p.amenities,
-          new Date().toLocaleString('en-NG')
-        ]
-      );
-    }
-    json(res, 200, { success: true, message: `Wiped all properties. Inserted ${PROPS.length} seed properties with images.`, count: PROPS.length });
-  } catch(e) {
-    json(res, 500, { error: e.message });
-  }
-}
-
-
-// ── Admin: Hard purge all test/seed/junk data ─────────────────────────────
-async function handleAdminPurge(data, res) {
-  try {
-    const results = {};
-    // Delete test disputes
-    const dr = await db.query("DELETE FROM disputes WHERE title ILIKE 'Test Dispute%' OR title ILIKE 'Test%' RETURNING id");
-    results.disputes_deleted = dr.rowCount;
-    // Delete test enquiries (E2E + Test Visitor + closed test ones)
-    const er = await db.query("DELETE FROM enquiries WHERE name ILIKE '%E2E%' OR name ILIKE 'Test%' OR name ILIKE 'Test User' OR status='closed' RETURNING id");
-    results.enquiries_deleted = er.rowCount;
-    // Hard delete rejected properties
-    const pr = await db.query("DELETE FROM properties WHERE status='rejected' RETURNING id");
-    results.properties_deleted = pr.rowCount;
-    // Hard delete E2E/test registrations
-    const rr = await db.query("DELETE FROM registrations WHERE id ILIKE '%E2E%' OR email ILIKE '%e2etest%' RETURNING id");
-    results.registrations_deleted = rr.rowCount;
-    // Delete the duplicate Idris renter account
-    const dup = await db.query("DELETE FROM registrations WHERE email='akansiology122@gmail.com' RETURNING id");
-    results.duplicate_accounts_deleted = dup.rowCount;
-    await logActivity('Admin purge executed: ' + JSON.stringify(results));
-    json(res, 200, { success: true, purged: results });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 

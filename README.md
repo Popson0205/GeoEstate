@@ -1,17 +1,39 @@
 # GeoEstate API v2.0
 
-Node.js + PostgreSQL (Neon) — Deployed on Render.com
+Node.js + PostgreSQL (Neon) — Deployed on Railway
 
-## Setup
+## Environment Variables (set in Railway dashboard)
 
-1. Set environment variables on Render:
-   - `SECRET_NEON_DATABASE_URL` — your Neon connection string
-   - `SECRET_RESEND_API_KEY` — your Resend API key
-   - `ADMIN_SECRET` — your admin token (keep this secret)
+| Variable | Description |
+|---|---|
+| `SECRET_NEON_DATABASE_URL` | Neon PostgreSQL connection string |
+| `SECRET_RESEND_API_KEY` | Resend email API key |
+| `ADMIN_SECRET` | Your admin token (keep secret — no default) |
+| `CLOUDINARY_CLOUD_NAME` | (Optional) Cloudinary cloud name for image uploads |
+| `CLOUDINARY_API_KEY` | (Optional) Cloudinary API key |
+| `CLOUDINARY_API_SECRET` | (Optional) Cloudinary API secret |
 
-2. Run `schema.sql` on your Neon database to apply migrations
+## Deploy on Railway
 
-3. Deploy: push to GitHub → Render auto-deploys
+1. Create a new Railway project → "Deploy from GitHub repo"
+2. Select `Popson0205/GeoEstate`
+3. Set the environment variables above
+4. Railway auto-detects Node.js and runs `node server.js`
+5. Add custom domain: `api.geoestate.com.ng` in Railway → Settings → Networking
+
+## Database Setup
+
+Run `schema.sql` on your Neon database once:
+
+```bash
+psql $SECRET_NEON_DATABASE_URL -f schema.sql
+```
+
+To wipe test/seed data from your Neon DB, run `clear-test-data.sql`:
+
+```bash
+psql $SECRET_NEON_DATABASE_URL -f clear-test-data.sql
+```
 
 ## Admin Authentication
 
@@ -19,32 +41,13 @@ All `/admin/*` routes require:
 ```
 Authorization: Bearer YOUR_ADMIN_SECRET
 ```
-or
-```
-X-Admin-Token: YOUR_ADMIN_SECRET
-```
 
 ## Owner Authentication
 
-1. POST `/owner/login` with `{ email }` → OTP sent
-2. POST `/owner/login` with `{ email, code }` → returns `token`
-3. Use token on all owner requests:
-```
-Authorization: Bearer owner:<userId>:<timestamp>
-```
+1. `POST /owner/login` with `{ email }` → OTP sent
+2. `POST /owner/login` with `{ email, code }` → returns `token`
+3. Use token: `Authorization: Bearer owner:<userId>:<timestamp>`
 
-## New in v2.0
+## Health Check
 
-- ✅ Admin auth middleware on all /admin/* routes
-- ✅ POST /admin/create-property (and /admin/save-property)
-- ✅ GET /properties with ?type=rent|buy|lease filter
-- ✅ GET /properties/:id (single property with units)
-- ✅ Owner dashboard routes (/owner/*)
-- ✅ One-time identity verification for owners
-- ✅ Property units CRUD (/owner/property/:id/units)
-- ✅ listing_type separation (rent/buy/lease)
-- ✅ Enquiry system (POST /enquiry)
-- ✅ Server-Sent Events (GET /events) for real-time sync
-- ✅ Payment tracking with tenancy linkage
-- ✅ Activity log broadcast via SSE
-- ✅ node_modules removed from repo (.gitignore added)
+`GET /health` — Returns `{ status: "ok" }`
