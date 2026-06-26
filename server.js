@@ -326,13 +326,36 @@ async function handleSendOTP(data, res) {
   const { email, name, purpose } = data;
   if (!email || !email.includes('@')) return json(res, 400, { error: 'Valid email required' });
   const code = generateOTP();
+
+  // Step 1: Save OTP to DB — this MUST happen regardless of email outcome
   try {
     await otpSet(email.toLowerCase(), code, 10 * 60 * 1000);
+  } catch(dbErr) {
+    console.error('OTP DB save failed:', dbErr.message);
+    return json(res, 500, { error: 'Could not save verification code. Please try again.' });
+  }
+
+  // Step 2: Send email — non-fatal. If Resend isn't configured or domain unverified,
+  // return devCode so the user/developer can complete verification without email.
+  const hasResend = !!RESEND_API_KEY;
+  if (!hasResend) {
+    console.warn('SECRET_RESEND_API_KEY not set — returning devCode for testing');
+    return json(res, 200, { success: true, message: 'Code generated (no email key)', testMode: true, devCode: code });
+  }
+
+  try {
     await sendEmail(email, 'GeoEstate — Your Code: ' + code, otpEmail(code, name || '', purpose || 'register'));
     json(res, 200, { success: true, message: 'Code sent to ' + email });
-  } catch(e) {
-    console.error('Email error:', e.message);
-    json(res, 500, { error: e.message });
+  } catch(emailErr) {
+    // Email failed (unverified domain, bounce, etc.) — code is in DB, surface devCode
+    console.warn('Email send failed:', emailErr.message, '— returning devCode fallback');
+    json(res, 200, {
+      success: true,
+      message: 'Email delivery issue — use code below',
+      testMode: true,
+      devCode: code,
+      emailError: emailErr.message
+    });
   }
 }
 
