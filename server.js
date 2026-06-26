@@ -253,7 +253,7 @@ function enquiryEmail(enq, property) {
 // ── Sales alert email template ───────────────────────────────────────────────
 function salesAlertEmail(enq, propertyTitle, salesPerson) {
   const waMsg = encodeURIComponent(
-    'Hi ' + enq.name + ', I\'m ' + salesPerson.name + ' from GeoEstate. I saw your enquiry about "' + propertyTitle + '". I\'d love to help you. When is a good time to talk?'
+    'Hi ' + salesPerson.name + ', I\'m ' + enq.name + '. I came across "' + propertyTitle + '" on GeoEstate and I\'d like to make further enquiries. When would be a good time to talk?'
   );
   const waLink = 'https://wa.me/' + enq.phone.replace(/[^0-9]/g,'') + '?text=' + waMsg;
   const waLinkSelf = 'https://wa.me/' + salesPerson.whatsapp + '?text=' + encodeURIComponent('New lead: ' + enq.name + ' (' + enq.phone + ') enquired about "' + propertyTitle + '"');
