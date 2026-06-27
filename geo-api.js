@@ -5,7 +5,7 @@
 (function(window) {
   'use strict';
 
-  const GEO_API = 'https://api.geoestate.com.ng/';
+  const GEO_API = 'https://api.geoestate.com.ng';
   const ADMIN_TOKEN_KEY = 'geo_admin_token';
   const OWNER_SESSION_KEY = 'geo_owner_session';
 
@@ -128,12 +128,15 @@
 
   async function adminFetch(path, opts) {
     opts = opts || {};
-    const r = await fetch(GEO_API + path, {
-      method: opts.method || 'GET',
-      headers: adminHeaders(),
-      body: opts.body ? JSON.stringify(opts.body) : undefined
-    });
-    return r.json();
+    try {
+      const r = await fetch(GEO_API + path, {
+        method: opts.method || 'GET',
+        headers: adminHeaders(),
+        body: opts.body ? JSON.stringify(opts.body) : undefined
+      });
+      if (!r.ok) return { error: 'HTTP ' + r.status };
+      return await r.json();
+    } catch(e) { return { error: e.message }; }
   }
 
   // ── Owner Auth ──────────────────────────────────────────────────
@@ -166,12 +169,15 @@
 
   async function ownerFetch(path, opts) {
     opts = opts || {};
-    const r = await fetch(GEO_API + path, {
-      method: opts.method || 'GET',
-      headers: ownerHeaders(),
-      body: opts.body ? JSON.stringify(opts.body) : undefined
-    });
-    return r.json();
+    try {
+      const r = await fetch(GEO_API + path, {
+        method: opts.method || 'GET',
+        headers: ownerHeaders(),
+        body: opts.body ? JSON.stringify(opts.body) : undefined
+      });
+      if (!r.ok) return { error: 'HTTP ' + r.status };
+      return await r.json();
+    } catch(e) { return { error: e.message }; }
   }
 
   // ── SSE Real-time sync ─────────────────────────────────────────

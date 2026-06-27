@@ -430,7 +430,7 @@ async function handleRegister(data, res) {
   if (!email || !fname) return json(res, 400, { error: 'Name and email required' });
   // pass is sent as btoa(password) from frontend doRegister()
   const pass_hash = data.pass || null;
-  const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
+  const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone, nin } = data; // FIX 2: added nin
   try {
     const exists = await db.query('SELECT id FROM registrations WHERE email = $1', [email.toLowerCase()]);
     if (exists.rows.length) return json(res, 200, { success: true, message: 'Already registered' });
@@ -439,14 +439,15 @@ async function handleRegister(data, res) {
     try {
       const { photo_url, id_doc_url, other_doc_url } = data;
       await db.query(
-        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone,photo_url,id_doc_url,other_doc_url,pass_hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone,nin,photo_url,id_doc_url,other_doc_url,pass_hash) // FIX 2: nin column added
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
         [subId, fname, lname, email.toLowerCase(), phone||'', role||'renter', role||'renter',
          new Date().toLocaleString('en-NG'), registeredAt||new Date().toISOString(),
          (fname[0]||'')+(lname[0]||''),
          dob||'—', gender||'—', occupation||'—', employer||'—',
          regState||'—', regLga||'—', regAddress||'—',
          next_of_kin||'—', next_of_kin_rel||'—', next_of_kin_phone||'—',
+         nin||'', // FIX: nin now saved
          photo_url||null, id_doc_url||null, other_doc_url||null, pass_hash||null]
       );
     } catch(e1) {
