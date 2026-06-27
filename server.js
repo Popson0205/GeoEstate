@@ -1349,7 +1349,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Token');
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
-  const url     = req.url.split('?')[0];
+  const url     = req.url.split('?')[0].replace(/\/+$/, '') || '/';
   const urlFull = req.url;
 
   // ── GET routes ──
@@ -1554,6 +1554,7 @@ async function handleSupabaseUploadSign(data, res) {
     );
     if (!signRes.ok) {
       const err = await signRes.text();
+      console.error('[upload-sign] Supabase error', signRes.status, err);
       return json(res, 500, { error: 'Could not create signed URL: ' + err });
     }
     const signData = await signRes.json();
