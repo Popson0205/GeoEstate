@@ -26,7 +26,7 @@ process.on('unhandledRejection', (reason) => {
 // ── DB Pool ──────────────────────────────────────────────────────────────────
 process.env.NODE_NO_WARNINGS = "1";
 const db = new Pool({
-  connectionString: process.env.SECRET_NEON_DATABASE_URL,
+  connectionString: process.env.SUPABASE_DB_URL, // Supabase: Settings → Database → URI (Transaction pooler, port 6543)
   ssl: { rejectUnauthorized: false }
 });
 
@@ -1425,7 +1425,7 @@ const server = http.createServer((req, res) => {
         if (url === '/register')             return handleRegister(data, res);
         if (url === '/user/login')            return handleUserLogin(data, res);
         if (url === '/enquiry')              return handleEnquiry(data, res);
-        if (url === '/upload-sign')           return handleCloudinarySign(data, res);
+        if (url === '/upload-sign')           return handleSupabaseUploadSign(data, res);
         if (url === '/submit-dispute')       return handleSubmitDispute(data, res);
 
         // Owner auth (no token needed)
@@ -1502,40 +1502,54 @@ async function handleOwnerPropertyDetail(ownerId, propId, res) {
 }
 
 // ── Cloudinary: Generate signed upload parameters ──────────────────────────
-// Browser calls POST /upload-sign → gets back signed params
-// → Browser uploads DIRECTLY to Cloudinary (no file bytes hit this server)
-// → Cloudinary returns secure_url → browser saves URL in reg payload
-async function handleCloudinarySign(data, res) {
-  const CLOUD_NAME   = process.env.CLOUDINARY_CLOUD_NAME;
-  const API_KEY      = process.env.CLOUDINARY_API_KEY;
-  const API_SECRET   = process.env.CLOUDINARY_API_SECRET;
+// ── Supabase Storage upload — POST /upload-sign ─────────────────────────────
+// Strategy: server creates a signed upload URL for the browser to PUT directly
+// to Supabase Storage. File bytes never touch this server.
+// Supabase Storage bucket: "geoestate-docs" (create this in Supabase Dashboard)
+async function handleSupabaseUploadSign(data, res) {
+  const SUPABASE_URL         = process.env.SUPABASE_URL;
+  const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+  const BUCKET               = process.env.SUPABASE_BUCKET || 'geoestate-docs';
 
-  if (!CLOUD_NAME || !API_KEY || !API_SECRET) {
-    return json(res, 503, { error: 'Image uploads not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Railway.' });
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return json(res, 503, { error: 'Storage not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in Railway environment variables.' });
   }
 
-  // data is passed directly from the outer body parser
+  const folder    = (data.folder || 'uploads').replace(/[^a-zA-Z0-9/_-]/g, '');
+  const ext       = data.ext || 'bin';
+  const filename  = folder + '/' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.' + ext;
 
-  const crypto = require('crypto');
-  const timestamp = Math.round(Date.now() / 1000);
-  const folder    = data.folder || 'geoestate/registrations';
-  const tags      = data.tags   || 'geoestate,registration';
-
-  // Build the string-to-sign — Cloudinary v2 requires ONLY the params
-  // that are actually included in the upload FormData, sorted alphabetically.
-  // Tags are NOT sent in the FormData so they must NOT be in the signature.
-  const toSign = `folder=${folder}&timestamp=${timestamp}${API_SECRET}`;
-  const signature = crypto.createHash('sha1').update(toSign).digest('hex');
-
-  json(res, 200, {
-    signature,
-    timestamp,
-    api_key: API_KEY,
-    cloud_name: CLOUD_NAME,
-    folder,
-    tags,              // returned for reference but NOT part of signature
-    tags_in_signature: false
-  });
+  try {
+    // Create a signed upload URL via Supabase Storage REST API
+    const signRes = await fetch(
+      `${SUPABASE_URL}/storage/v1/object/upload/sign/${BUCKET}/${filename}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ upsert: false })
+      }
+    );
+    if (!signRes.ok) {
+      const err = await signRes.text();
+      return json(res, 500, { error: 'Could not create signed URL: ' + err });
+    }
+    const signData = await signRes.json();
+    // signedURL is the path for the browser to PUT to
+    // Public URL is how we read the file back
+    const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${filename}`;
+    json(res, 200, {
+      signed_url:  SUPABASE_URL + '/storage/v1' + signData.url,
+      public_url:  publicUrl,
+      token:       signData.token,
+      path:        filename,
+      bucket:      BUCKET
+    });
+  } catch(e) {
+    json(res, 500, { error: e.message });
+  }
 }
 
 
