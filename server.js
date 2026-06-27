@@ -433,7 +433,7 @@ async function handleRegister(data, res) {
   const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone, nin } = data; // FIX 2: added nin
   try {
     const exists = await db.query('SELECT id FROM registrations WHERE email = $1', [email.toLowerCase()]);
-    if (exists.rows.length) return json(res, 200, { success: true, message: 'Already registered' });
+    if (exists.rows.length) return json(res, 200, { success: true, message: 'Already registered', submissionId: exists.rows[0].id });
     const subId = id || ('USR-' + Date.now());
     // Try full insert with all extended fields, fall back to minimal
     try {
