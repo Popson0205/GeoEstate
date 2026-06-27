@@ -982,44 +982,64 @@ async function handleOwnerProfile(ownerId, res) {
 
 async function handleOwnerVerifyIdentity(ownerId, data, res) {
   try {
-    // Check if already verified
     const r = await db.query('SELECT is_verified FROM registrations WHERE id=$1', [ownerId]);
-    if (r.rows[0]?.is_verified) return json(res, 200, { success: true, alreadyVerified: true, message: 'Already verified — no action needed.' });
+    if (!r.rows.length) return json(res, 404, { error: 'User not found.' });
+    if (r.rows[0]?.is_verified) return json(res, 200, { success: true, alreadyVerified: true, message: 'Already verified.' });
 
-    const { nin, doc_type, doc_url, selfie_url, dob, gender, occupation, employer, state, lga, address, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
-    // Try full update with all fields, fall back to minimal if columns missing
-    try {
-      await db.query(
-        `UPDATE registrations SET
-          nin=$1, doc=$2, is_verified=false, status=$3,
-          dob=COALESCE(NULLIF($5,''),dob),
-          gender=COALESCE(NULLIF($6,''),gender),
-          occupation=COALESCE(NULLIF($7,''),occupation),
-          employer=COALESCE(NULLIF($8,''),employer),
-          state=COALESCE(NULLIF($9,''),state),
-          lga=COALESCE(NULLIF($10,''),lga),
-          address=COALESCE(NULLIF($11,''),address),
-          next_of_kin=COALESCE(NULLIF($12,''),next_of_kin),
-          next_of_kin_rel=COALESCE(NULLIF($13,''),next_of_kin_rel),
-          next_of_kin_phone=COALESCE(NULLIF($14,''),next_of_kin_phone),
-          updated_at=NOW()
-        WHERE id=$4`,
-        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId,
-         dob||'', gender||'', occupation||'', employer||'',
-         state||'', lga||'', address||'',
-         next_of_kin||'', next_of_kin_rel||'', next_of_kin_phone||'']
-      );
-    } catch(e) {
-      // Fallback: minimal update if extended columns don't exist
-      await db.query(
-        'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, updated_at=NOW() WHERE id=$4',
-        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId]
-      );
-    }
-    await logActivity('Owner identity submitted for review: ' + ownerId);
-    json(res, 200, { success: true, message: 'Identity submitted. You will be notified once verified (usually within 24 hours).' });
-  } catch(e) { json(res, 500, { error: e.message }); }
+    const {
+      nin, doc_type, doc_url, selfie_url, id_doc_url, photo_url,
+      dob, gender, occupation, employer,
+      state, lga, address,
+      next_of_kin, next_of_kin_rel, next_of_kin_phone
+    } = data;
+
+    // Resolve URLs — frontend sends both selfie_url and photo_url (same file)
+    const resolvedPhotoUrl  = photo_url  || selfie_url  || null;
+    const resolvedIdDocUrl  = id_doc_url || doc_url     || null;
+    // doc column: store as "type|url" for legacy admin display
+    const docString = (doc_type || 'Government ID') + '|' + (resolvedIdDocUrl || '');
+
+    await db.query(
+      `UPDATE registrations SET
+        nin                = COALESCE(NULLIF($1,''), nin),
+        doc                = $2,
+        photo_url          = COALESCE($3, photo_url),
+        id_doc_url         = COALESCE($4, id_doc_url),
+        status             = 'review',
+        dob                = COALESCE(NULLIF($5,''), dob),
+        gender             = COALESCE(NULLIF($6,''), gender),
+        occupation         = COALESCE(NULLIF($7,''), occupation),
+        employer           = COALESCE(NULLIF($8,''), employer),
+        state              = COALESCE(NULLIF($9,''), state),
+        lga                = COALESCE(NULLIF($10,''), lga),
+        address            = COALESCE(NULLIF($11,''), address),
+        next_of_kin        = COALESCE(NULLIF($12,''), next_of_kin),
+        next_of_kin_rel    = COALESCE(NULLIF($13,''), next_of_kin_rel),
+        next_of_kin_phone  = COALESCE(NULLIF($14,''), next_of_kin_phone),
+        updated_at         = NOW()
+      WHERE id = $15`,
+      [
+        nin || '',
+        docString,
+        resolvedPhotoUrl,
+        resolvedIdDocUrl,
+        dob || '',        gender || '',
+        occupation || '', employer || '',
+        state || '',      lga || '',
+        address || '',
+        next_of_kin || '', next_of_kin_rel || '', next_of_kin_phone || '',
+        ownerId
+      ]
+    );
+
+    await logActivity('Identity verification submitted: ' + ownerId);
+    json(res, 200, { success: true, message: 'Identity submitted for review. You will be notified within 24 hours.' });
+  } catch(e) {
+    console.error('verify-identity error:', e.message);
+    json(res, 500, { error: e.message });
+  }
 }
+
 
 async function handleOwnerProperties(ownerId, urlFull, res) {
   try {
