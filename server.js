@@ -1545,9 +1545,19 @@ async function handleAdminLogin(data, res) {
   const { email, password } = data;
   if (!email || !password) return json(res, 400, { error: 'Email and password required' });
 
-  // Constant-time comparison to prevent timing attacks
-  const emailOk    = crypto.timingSafeEqual(Buffer.from(email.toLowerCase().trim()), Buffer.from(ADMIN_EMAIL.toLowerCase().trim()));
-  const passwordOk = crypto.timingSafeEqual(Buffer.from(password), Buffer.from(ADMIN_PASSWORD));
+  // Constant-time comparison — pad buffers to same length to prevent
+  // timingSafeEqual throwing on length mismatch (which causes a 524 timeout)
+  function safeEqual(a, b) {
+    const ba = Buffer.from(a);
+    const bb = Buffer.from(b);
+    // Always compare max-length buffer to avoid short-circuit timing leak
+    const maxLen = Math.max(ba.length, bb.length);
+    const pa = Buffer.concat([ba, Buffer.alloc(maxLen - ba.length)]);
+    const pb = Buffer.concat([bb, Buffer.alloc(maxLen - bb.length)]);
+    return crypto.timingSafeEqual(pa, pb) && ba.length === bb.length;
+  }
+  const emailOk    = safeEqual(email.toLowerCase().trim(), ADMIN_EMAIL.toLowerCase().trim());
+  const passwordOk = safeEqual(password, ADMIN_PASSWORD);
 
   if (!emailOk || !passwordOk) {
     await new Promise(r => setTimeout(r, 500)); // slow down brute force
