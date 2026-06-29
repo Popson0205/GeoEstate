@@ -1295,16 +1295,18 @@ async function handleGetAdminEnquiries(res) {
 // ── SSE ───────────────────────────────────────────────────────────────────────
 function handleSSE(req, res) {
   res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
+    'Content-Type':      'text/event-stream',
+    'Cache-Control':     'no-cache',
+    'Connection':        'keep-alive',
+    'X-Accel-Buffering': 'no',
     'Access-Control-Allow-Origin': '*'
   });
   res.write('data: {"type":"connected"}\n\n');
   sseClients.add(res);
+  // 15s ping keeps Railway HTTP/2 proxy from resetting idle SSE streams
   const ping = setInterval(() => {
     try { res.write(':ping\n\n'); } catch(e) { clearInterval(ping); sseClients.delete(res); }
-  }, 30000);
+  }, 15000);
   req.on('close', () => { clearInterval(ping); sseClients.delete(res); });
 }
 
