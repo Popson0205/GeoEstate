@@ -1,5 +1,7 @@
--- GeoEstate Platform — Complete Schema v2.0
--- Run this on your Neon PostgreSQL database to set up or migrate
+-- GeoEstate Platform — Complete Schema v2.1 (Supabase)
+-- Run this in the Supabase SQL Editor (Dashboard → SQL Editor → New Query).
+-- Every statement uses CREATE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS —
+-- safe to re-run on an existing database without data loss.
 
 -- ═══════════════════════════════════════════════════════
 -- CORE TABLES
@@ -32,9 +34,15 @@ CREATE TABLE IF NOT EXISTS registrations (
   next_of_kin     TEXT DEFAULT '—',
   next_of_kin_rel TEXT DEFAULT '—',
   next_of_kin_phone TEXT DEFAULT '—',
-  -- PHASE 2: Owner fields
+  -- Owner verification fields
   is_verified     BOOLEAN DEFAULT FALSE,
   owner_since     TIMESTAMPTZ,
+  -- Upload URLs (Supabase Storage)
+  photo_url       TEXT DEFAULT NULL,
+  id_doc_url      TEXT DEFAULT NULL,
+  other_doc_url   TEXT DEFAULT NULL,
+  -- Password hash (base64 of raw password — set on first login)
+  pass_hash       TEXT DEFAULT NULL,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -44,16 +52,13 @@ CREATE TABLE IF NOT EXISTS properties (
   title           TEXT NOT NULL,
   owner           TEXT,
   owner_id        TEXT REFERENCES registrations(id),
-  -- PHASE 1: listing_type separates rent/buy/lease
   listing_type    TEXT DEFAULT 'rent' CHECK (listing_type IN ('rent','buy','lease')),
   type            TEXT DEFAULT 'rent',
   status          TEXT DEFAULT 'pending',
-  -- Price fields by listing type
   price           TEXT,
   monthly_rent    NUMERIC,
   sale_price      NUMERIC,
   lease_price     NUMERIC,
-  -- Property details
   state           TEXT,
   lga             TEXT,
   address         TEXT,
@@ -74,7 +79,6 @@ CREATE TABLE IF NOT EXISTS properties (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- PHASE 3: Property units (rooms, flats, shops, etc.)
 CREATE TABLE IF NOT EXISTS property_units (
   id                  SERIAL PRIMARY KEY,
   property_id         TEXT REFERENCES properties(id) ON DELETE CASCADE,
@@ -92,7 +96,6 @@ CREATE TABLE IF NOT EXISTS property_units (
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- PHASE 4: Enquiries
 CREATE TABLE IF NOT EXISTS enquiries (
   id              TEXT PRIMARY KEY,
   property_id     TEXT REFERENCES properties(id),
@@ -104,6 +107,8 @@ CREATE TABLE IF NOT EXISTS enquiries (
   status          TEXT DEFAULT 'new',
   notes           TEXT DEFAULT '',
   assigned_to     TEXT DEFAULT '',
+  -- Cached property title so enquiry is readable even if property deleted
+  property_title  TEXT DEFAULT '',
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -214,9 +219,7 @@ CREATE TABLE IF NOT EXISTS activity_log (
   logged_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- PHASE 5: OTP codes — moved out of in-process memory so they survive
--- across serverless invocations (Vercel does not guarantee the same
--- instance handles /send-otp and the later /verify-otp request).
+-- OTP codes stored in DB (survive Railway restarts / multi-instance deploys)
 CREATE TABLE IF NOT EXISTS otp_codes (
   key             TEXT PRIMARY KEY,
   code            TEXT NOT NULL,
@@ -225,71 +228,87 @@ CREATE TABLE IF NOT EXISTS otp_codes (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ═══════════════════════════════════════════════════════
--- MIGRATION STATEMENTS (safe to run on existing DB)
--- ═══════════════════════════════════════════════════════
-
--- Add owner fields to existing registrations table
-ALTER TABLE registrations ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;
-ALTER TABLE registrations ADD COLUMN IF NOT EXISTS owner_since TIMESTAMPTZ;
-
--- Add listing_type and new price columns to properties
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS listing_type TEXT DEFAULT 'rent';
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS monthly_rent NUMERIC;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS sale_price NUMERIC;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS lease_price NUMERIC;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS images JSONB DEFAULT '[]';
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS bedrooms INTEGER;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS bathrooms INTEGER;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS size_sqm NUMERIC;
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
-ALTER TABLE properties ADD COLUMN IF NOT EXISTS amenities JSONB DEFAULT '[]';
-
--- Backfill listing_type from type column
-UPDATE properties SET listing_type = type WHERE listing_type IS NULL OR listing_type = '';
-
--- Add unit and tenant refs to tenancies
-ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS property_id TEXT;
-ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS unit_id INTEGER;
-ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS tenant_id TEXT;
-
--- Add tenancy_id to payments
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS tenancy_id INTEGER;
-
--- Add notes to disputes
-ALTER TABLE disputes ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT '';
-
--- Add sales tracking fields to enquiries
-ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT '';
-ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS assigned_to TEXT DEFAULT '';
-
--- ═══════════════════════════════════════════════════════
--- INDEXES
--- ═══════════════════════════════════════════════════════
-CREATE INDEX IF NOT EXISTS idx_registrations_status ON registrations(status);
-CREATE INDEX IF NOT EXISTS idx_registrations_email ON registrations(email);
-CREATE INDEX IF NOT EXISTS idx_registrations_role ON registrations(role);
-CREATE INDEX IF NOT EXISTS idx_properties_status ON properties(status);
-CREATE INDEX IF NOT EXISTS idx_properties_listing_type ON properties(listing_type);
-CREATE INDEX IF NOT EXISTS idx_properties_owner_id ON properties(owner_id);
-CREATE INDEX IF NOT EXISTS idx_property_units_property_id ON property_units(property_id);
-CREATE INDEX IF NOT EXISTS idx_property_units_status ON property_units(status);
-CREATE INDEX IF NOT EXISTS idx_tenancies_end_date ON tenancies(end_date);
-CREATE INDEX IF NOT EXISTS idx_tenancies_status ON tenancies(status);
-CREATE INDEX IF NOT EXISTS idx_enquiries_property_id ON enquiries(property_id);
-CREATE INDEX IF NOT EXISTS idx_enquiries_status ON enquiries(status);
-CREATE INDEX IF NOT EXISTS idx_otp_codes_expires ON otp_codes(expires);
-
--- ═══════════════════════════════════════════════════════
--- ADMIN AUTH (added June 2026)
--- ═══════════════════════════════════════════════════════
-
--- Admin session log (audit trail — JWT is stateless but we log logins)
+-- Admin login audit log
 CREATE TABLE IF NOT EXISTS admin_sessions (
   id          SERIAL PRIMARY KEY,
   email       TEXT NOT NULL,
-  action      TEXT NOT NULL DEFAULT 'login', -- 'login' | 'logout'
+  action      TEXT NOT NULL DEFAULT 'login',
   ip          TEXT,
   user_agent  TEXT,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ═══════════════════════════════════════════════════════
+-- MIGRATION — safe to run on existing databases
+-- ═══════════════════════════════════════════════════════
+
+-- Owner verification columns
+ALTER TABLE registrations ADD COLUMN IF NOT EXISTS is_verified     BOOLEAN DEFAULT FALSE;
+ALTER TABLE registrations ADD COLUMN IF NOT EXISTS owner_since     TIMESTAMPTZ;
+
+-- Supabase Storage upload URLs (v2.1 — replaces old Cloudinary fields)
+ALTER TABLE registrations ADD COLUMN IF NOT EXISTS photo_url       TEXT DEFAULT NULL;
+ALTER TABLE registrations ADD COLUMN IF NOT EXISTS id_doc_url      TEXT DEFAULT NULL;
+ALTER TABLE registrations ADD COLUMN IF NOT EXISTS other_doc_url   TEXT DEFAULT NULL;
+
+-- Password hash (base64 of raw password, set on first login)
+ALTER TABLE registrations ADD COLUMN IF NOT EXISTS pass_hash       TEXT DEFAULT NULL;
+
+-- Property listing_type and price breakdowns
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS listing_type   TEXT DEFAULT 'rent';
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS monthly_rent   NUMERIC;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS sale_price     NUMERIC;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS lease_price    NUMERIC;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS images         JSONB DEFAULT '[]';
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS bedrooms       INTEGER;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS bathrooms      INTEGER;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS size_sqm       NUMERIC;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS description    TEXT DEFAULT '';
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS amenities      JSONB DEFAULT '[]';
+
+-- Backfill listing_type from type column on existing rows
+UPDATE properties SET listing_type = type WHERE listing_type IS NULL OR listing_type = '';
+
+-- Tenancy foreign keys (added v2)
+ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS property_id TEXT;
+ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS unit_id     INTEGER;
+ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS tenant_id   TEXT;
+
+-- Payment → tenancy link
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS tenancy_id INTEGER;
+
+-- Dispute notes
+ALTER TABLE disputes ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT '';
+
+-- Enquiry tracking columns
+ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS notes           TEXT DEFAULT '';
+ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS assigned_to     TEXT DEFAULT '';
+ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS property_title  TEXT DEFAULT '';
+
+-- ═══════════════════════════════════════════════════════
+-- INDEXES
+-- ═══════════════════════════════════════════════════════
+CREATE INDEX IF NOT EXISTS idx_registrations_status      ON registrations(status);
+CREATE INDEX IF NOT EXISTS idx_registrations_email       ON registrations(email);
+CREATE INDEX IF NOT EXISTS idx_registrations_role        ON registrations(role);
+CREATE INDEX IF NOT EXISTS idx_properties_status         ON properties(status);
+CREATE INDEX IF NOT EXISTS idx_properties_listing_type   ON properties(listing_type);
+CREATE INDEX IF NOT EXISTS idx_properties_owner_id       ON properties(owner_id);
+CREATE INDEX IF NOT EXISTS idx_property_units_property   ON property_units(property_id);
+CREATE INDEX IF NOT EXISTS idx_property_units_status     ON property_units(status);
+CREATE INDEX IF NOT EXISTS idx_tenancies_end_date        ON tenancies(end_date);
+CREATE INDEX IF NOT EXISTS idx_tenancies_status          ON tenancies(status);
+CREATE INDEX IF NOT EXISTS idx_enquiries_property_id     ON enquiries(property_id);
+CREATE INDEX IF NOT EXISTS idx_enquiries_status          ON enquiries(status);
+CREATE INDEX IF NOT EXISTS idx_otp_codes_expires         ON otp_codes(expires);
+
+-- ═══════════════════════════════════════════════════════
+-- SUPABASE STORAGE — run this once in the Supabase Dashboard
+-- ═══════════════════════════════════════════════════════
+-- 1. Go to Storage → New bucket
+-- 2. Name: geoestate-docs
+-- 3. Set to PUBLIC (so URLs work without auth tokens)
+-- 4. Allowed MIME types: image/*, application/pdf
+--
+-- The bucket name must match the SUPABASE_BUCKET env var on Railway
+-- (default: geoestate-docs).

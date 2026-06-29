@@ -1,7 +1,7 @@
 {
   "name": "geoestate-api",
-  "version": "1.0.0",
-  "description": "GeoEstate OTP & Registration API",
+  "version": "2.1.0",
+  "description": "GeoEstate API — OTP, Registration, Properties, Owner Portal (Supabase)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
