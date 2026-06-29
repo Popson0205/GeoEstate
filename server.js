@@ -390,8 +390,14 @@ async function handleUserLogin(data, res) {
     const user = r.rows[0];
     const expected = Buffer.from(password).toString('base64');
     if (user.pass_hash) {
-      if (user.pass_hash !== expected) {
+      // Accept: base64(plain) match (normal path) OR direct plain match (legacy/edge case)
+      const match = user.pass_hash === expected || user.pass_hash === password;
+      if (!match) {
         return json(res, 401, { error: 'Incorrect password. Please try again.' });
+      }
+      // If stored as plain (legacy), upgrade to base64 silently
+      if (user.pass_hash === password && user.pass_hash !== expected) {
+        await db.query('UPDATE registrations SET pass_hash=$1 WHERE id=$2', [expected, user.id]).catch(() => {});
       }
     } else {
       await db.query(
