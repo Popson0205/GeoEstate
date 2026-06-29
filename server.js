@@ -405,8 +405,11 @@ async function handleUserLogin(data, res) {
         [expected, user.id]
       ).catch(e => console.warn('pass_hash update failed:', e.message));
     }
+    // Issue a JWT so the frontend can use ownerFetch / add-property immediately after login
+    const loginToken = jwtSign({ iss: 'owner', sub: user.id, role: user.role || 'owner', email: user.email }, JWT_SECRET, 8);
     json(res, 200, {
       success: true,
+      token: loginToken,
       user: {
         id:       user.id,
         fname:    user.fname,
@@ -459,7 +462,8 @@ async function handleRegister(data, res) {
     await logActivity('New registration: ' + fname + ' ' + lname + ' (' + (role==='owner'?'Owner':'Renter') + ')');
     sendEmail('admin@geoestate.com.ng', '🆕 New Registration: ' + fname + ' ' + lname, adminAlertEmail({fname,lname,email,phone,role,id:subId}))
       .catch(e => console.warn('Admin alert failed:', e.message));
-    json(res, 200, { success: true, submissionId: subId });
+    const regToken = jwtSign({ iss: 'owner', sub: subId, role: role || 'renter', email: email.toLowerCase() }, JWT_SECRET, 8);
+    json(res, 200, { success: true, submissionId: subId, token: regToken });
   } catch(e) {
     console.error('Register error:', e.message);
     json(res, 500, { error: e.message });
