@@ -577,6 +577,12 @@ async function handleGetProperties(res) {
         COALESCE(size_sqm, NULL) as size_sqm,
         COALESCE(description, '') as description,
         COALESCE(amenities, '[]'::jsonb) as amenities,
+        COALESCE(docs, '[]'::jsonb) as docs,
+        COALESCE(geo, false) as geo,
+        COALESCE(lawyer_req, false) as lawyer_req,
+        lawyer_assigned,
+        COALESCE(lat, NULL) as lat,
+        COALESCE(lng, NULL) as lng,
         notes, submitted, created_at, updated_at
       FROM properties ORDER BY created_at DESC
     `);
@@ -671,7 +677,7 @@ async function handleAdminUpdate(url, data, res) {
   if (propMatch) {
     const id = propMatch[1];
     try {
-      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo'];
+      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo','lat','lng'];
       const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
       if (!fields.length) return json(res, 400, { error: 'No valid fields' });
       const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');
