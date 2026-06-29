@@ -543,6 +543,7 @@ async function handleGetRegistrations(url, res) {
       nextOfKin: r.next_of_kin||'—', nextOfKinRel: r.next_of_kin_rel||'—',
       nextOfKinPhone: r.next_of_kin_phone||'—',
       isVerified: r.is_verified||false,
+      verified_at: r.verified_at||null, updated_at: r.updated_at||null,
       // FIX 3: expose upload URLs so admin card can show selfie/doc previews
       photo_url: r.photo_url||null, id_doc_url: r.id_doc_url||null
     }));
@@ -625,10 +626,18 @@ async function handleAdminUpdate(url, data, res) {
     const id = regMatch[1];
     const { status, reviewer, notes } = data;
     try {
-      await db.query(
-        'UPDATE registrations SET status=$1, reviewer=$2, notes=$3, updated_at=NOW() WHERE id=$4',
-        [status, reviewer||'Admin', notes||'', id]
-      );
+      // Set verified_at timestamp when approving identity
+      if (status === 'approved') {
+        await db.query(
+          'UPDATE registrations SET status=$1, reviewer=$2, notes=$3, updated_at=NOW(), verified_at=NOW() WHERE id=$4',
+          [status, reviewer||'Admin', notes||'', id]
+        );
+      } else {
+        await db.query(
+          'UPDATE registrations SET status=$1, reviewer=$2, notes=$3, updated_at=NOW() WHERE id=$4',
+          [status, reviewer||'Admin', notes||'', id]
+        );
+      }
       if (status === 'approved') {
         try {
           await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
@@ -636,6 +645,7 @@ async function handleAdminUpdate(url, data, res) {
           try {
             await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE");
             await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS owner_since TIMESTAMPTZ");
+            await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ");
             await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
           } catch(e2) { console.warn('is_verified column fix failed:', e2.message); }
         }
