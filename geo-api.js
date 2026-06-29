@@ -191,11 +191,14 @@
   // ── SSE Real-time sync ─────────────────────────────────────────
   let sseSource = null;
   const sseHandlers = {};
-  let sseRetryDelay = 2000;
+  let sseRetryDelay = 5000;
   const SSE_MAX_DELAY = 60000;
+  let sseStarted = false;
 
   function startSSE() {
     if (sseSource) return;
+    if (sseStarted) return;
+    sseStarted = true;
     try {
       sseSource = new EventSource(GEO_API + '/events');
       sseSource.onmessage = function(e) {
@@ -216,10 +219,11 @@
       sseSource.onerror = function() {
         // Reconnect with exponential backoff to reduce HTTP/2 protocol error noise
         if (sseSource) { sseSource.close(); sseSource = null; }
+        sseStarted = false;
         setTimeout(function() { sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY); startSSE(); }, sseRetryDelay);
       };
-      sseSource.onopen = function() { sseRetryDelay = 2000; }; // reset on success
-    } catch(e) {}
+      sseSource.onopen = function() { sseRetryDelay = 5000; }; // reset on success
+    } catch(e) { sseStarted = false; }
   }
 
   function onSSE(event, fn) {
@@ -257,10 +261,13 @@
     API_BASE: GEO_API
   };
 
-  // Auto-start SSE on any page
+  // Auto-start SSE on any page — delayed 3s to let the page settle and avoid
+  // ERR_CONNECTION_RESET noise from the browser on cold loads
   if (typeof window !== 'undefined') {
     window.addEventListener('load', function() {
-      try { startSSE(); } catch(e) {}
+      setTimeout(function() {
+        try { startSSE(); } catch(e) {}
+      }, 3000);
     });
   }
 
