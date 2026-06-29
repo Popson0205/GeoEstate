@@ -191,7 +191,7 @@
   // ── SSE Real-time sync ─────────────────────────────────────────
   let sseSource = null;
   const sseHandlers = {};
-  let sseRetryDelay = 5000;
+  let sseRetryDelay = 2000;
   const SSE_MAX_DELAY = 60000;
 
   function startSSE() {
@@ -218,7 +218,7 @@
         if (sseSource) { sseSource.close(); sseSource = null; }
         setTimeout(function() { sseRetryDelay = Math.min(sseRetryDelay * 2, SSE_MAX_DELAY); startSSE(); }, sseRetryDelay);
       };
-      sseSource.onopen = function() { sseRetryDelay = 5000; }; // reset on success
+      sseSource.onopen = function() { sseRetryDelay = 2000; }; // reset on success
     } catch(e) {}
   }
 
