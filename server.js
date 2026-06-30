@@ -519,7 +519,7 @@ async function handlePublicPropertyById(id, res) {
     let prop;
     try {
       const r = await db.query(
-        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,COALESCE(property_type,'single') as property_type,notes,created_at FROM properties WHERE id=$1",
+        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,COALESCE(property_type,'single') as property_type,COALESCE(unit_structure,'single') as unit_structure,COALESCE(units_json,'[]'::jsonb) as units_json,COALESCE(total_units,NULL) as total_units,notes,created_at FROM properties WHERE id=$1",
         [id]
       );
       if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
@@ -569,6 +569,8 @@ async function handleGetProperties(res) {
     const result = await db.query(`
       SELECT id, title, owner, owner_id, type,
         COALESCE(listing_type, type, 'rent') as listing_type,
+        COALESCE(unit_structure,'single') as unit_structure,
+        COALESCE(total_units,NULL) as total_units,
         COALESCE(property_type,'single') as property_type,
         status, price,
         COALESCE(monthly_rent, NULL) as monthly_rent,
@@ -664,7 +666,7 @@ async function handleAdminUpdate(url, data, res) {
     const id = propMatch[1];
     try {
       // FIX 3: property_type added to allowed fields
-      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo','property_type'];
+      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo','property_type','unit_structure','units_json','total_units'];
       const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
       if (!fields.length) return json(res, 400, { error: 'No valid fields' });
       const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');
@@ -1035,7 +1037,7 @@ async function handleOwnerProperties(ownerId, urlFull, res) {
   try {
     const params = new URL('http://x' + urlFull).searchParams;
     const type = params.get('type');
-    let q = "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,COALESCE(property_type,'single') as property_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE owner_id=$1";
+    let q = "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,COALESCE(property_type,'single') as property_type,COALESCE(unit_structure,'single') as unit_structure,COALESCE(units_json,'[]'::jsonb) as units_json,COALESCE(total_units,NULL) as total_units,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE owner_id=$1";
     const args = [ownerId];
     if (type) { args.push(type); q += " AND COALESCE(listing_type,type,'rent')=$" + args.length; }
     q += ' ORDER BY created_at DESC';
@@ -1076,15 +1078,20 @@ async function handleOwnerAddProperty(ownerId, data, res) {
     vrRow = { is_verified: vr2.rows[0].status === 'approved', status: vr2.rows[0].status };
   }
   if (!vrRow.is_verified && vrRow.status !== 'approved') return json(res, 403, { error: 'Identity not yet verified', needsVerification: true });
-  const { title, listing_type, price, monthly_rent, sale_price, lease_price, state, lga, address, img, images, bedrooms, bathrooms, size_sqm, description, amenities, notes, property_type } = data;
+  const { title, listing_type, price, monthly_rent, sale_price, lease_price, state, lga, address, img, images, bedrooms, bathrooms, size_sqm, description, amenities, notes, property_type,
+          unit_structure, units_json, total_units } = data;
   if (!title) return json(res, 400, { error: 'Property title required' });
   if (!listing_type || !['rent','buy','lease'].includes(listing_type)) return json(res, 400, { error: 'listing_type must be rent, buy, or lease' });
+  const _unitStructure = unit_structure === 'multi' ? 'multi' : 'single';
+  let _unitsJson = '[]';
+  try { _unitsJson = JSON.stringify(typeof units_json === 'string' ? JSON.parse(units_json||'[]') : (units_json||[])); } catch(e) {}
+  const _totalUnits = parseInt(total_units) || null;
   const propId = 'PROP-' + Date.now();
   try {
     await db.query(
-      `INSERT INTO properties (id,title,owner_id,owner,listing_type,type,status,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,size_sqm,description,amenities,notes,property_type,submitted)
-       VALUES ($1,$2,$3,(SELECT fname||' '||lname FROM registrations WHERE id=$3),$4,$4,'pending',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
-      [propId, title, ownerId, listing_type, price||'', monthly_rent||null, sale_price||null, lease_price||null, state||'', lga||'', address||'', img||'', JSON.stringify(images||[]), bedrooms||null, bathrooms||null, size_sqm||null, description||'', JSON.stringify(amenities||[]), notes||'', property_type||'single', new Date().toLocaleString('en-NG')]
+      `INSERT INTO properties (id,title,owner_id,owner,listing_type,type,status,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,size_sqm,description,amenities,notes,property_type,unit_structure,units_json,total_units,submitted)
+       VALUES ($1,$2,$3,(SELECT fname||' '||lname FROM registrations WHERE id=$3),$4,$4,'pending',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+      [propId, title, ownerId, listing_type, price||'', monthly_rent||null, sale_price||null, lease_price||null, state||'', lga||'', address||'', img||'', JSON.stringify(images||[]), bedrooms||null, bathrooms||null, size_sqm||null, description||'', JSON.stringify(amenities||[]), notes||'', property_type||'single', _unitStructure, _unitsJson, _totalUnits, new Date().toLocaleString('en-NG')]
     );
     await logActivity('Owner ' + ownerId + ' listed new property: ' + title);
     json(res, 200, { success: true, propertyId: propId, message: 'Property submitted for review. It will go live once approved.' });
@@ -1095,7 +1102,7 @@ async function handleOwnerUpdateProperty(ownerId, propId, data, res) {
   const own = await db.query('SELECT id FROM properties WHERE id=$1 AND owner_id=$2', [propId, ownerId]);
   if (!own.rows.length) return json(res, 403, { error: 'Property not found or not yours' });
   try {
-    const allowed = ['title','listing_type','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','property_type'];
+    const allowed = ['title','listing_type','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','property_type','unit_structure','units_json','total_units'];
     const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
     if (!fields.length) return json(res, 400, { error: 'No valid fields' });
     const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');
