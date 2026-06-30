@@ -862,30 +862,46 @@ async function handleSavePayment(data, res) {
 
 // FIX 2: Client notifies payment — creates payment queue entry + transaction
 async function handleClientPaymentNotification(data, res) {
-  const { property_id, property_title, buyer_name, buyer_email, buyer_phone, amount, ref, enquiry_id } = data;
+  // Accepts both /submit-payment (legacy) and /notify-payment
+  const { property_id, property_title, buyer_name, buyer_email, buyer_phone,
+          amount, ref, enquiry_id,
+          unit_id, unit_label, unit_price } = data;
   if (!ref || !property_id) return json(res, 400, { error: 'ref and property_id are required' });
+
+  // For multi-unit: amount is unit_price (per-unit), not whole-property price
+  const finalAmount = unit_price || amount || 0;
   const txnId = 'TXN-' + Date.now();
   try {
     // Ensure columns exist
     await db.query("ALTER TABLE payments ADD COLUMN IF NOT EXISTS transaction_id TEXT").catch(()=>{});
     await db.query("ALTER TABLE payments ADD COLUMN IF NOT EXISTS enquiry_id TEXT").catch(()=>{});
+    await db.query("ALTER TABLE payments ADD COLUMN IF NOT EXISTS unit_id INTEGER").catch(()=>{});
+    await db.query("ALTER TABLE payments ADD COLUMN IF NOT EXISTS unit_label TEXT DEFAULT ''").catch(()=>{});
 
-    // Create transaction in queue
+    // Prop label: include unit label for multi-unit properties
+    const propLabel = unit_label
+      ? (property_title || property_id) + ' — ' + unit_label
+      : (property_title || property_id);
+
+    // Create transaction in queue — unit-specific
     await db.query(
       `INSERT INTO transactions (id,property,buyer,amount,status)
        VALUES ($1,$2,$3,$4,'payment_queue')
        ON CONFLICT (id) DO NOTHING`,
-      [txnId, property_title || property_id, buyer_name || '', amount || 0]
+      [txnId, propLabel, buyer_name || '', finalAmount]
     );
-    // Create payment record linked to transaction
+    // Create payment record linked to transaction + unit
     await db.query(
-      `INSERT INTO payments (ref,prop,buyer,phone,amount,status,transaction_id,enquiry_id)
-       VALUES ($1,$2,$3,$4,$5,'payment_received',$6,$7)
-       ON CONFLICT (ref) DO UPDATE SET status='payment_received', transaction_id=$6, enquiry_id=$7`,
-      [ref, property_title || property_id, buyer_name || '', buyer_phone || '', amount || 0, txnId, enquiry_id || null]
+      `INSERT INTO payments (ref,prop,buyer,phone,amount,status,transaction_id,enquiry_id,unit_id,unit_label)
+       VALUES ($1,$2,$3,$4,$5,'payment_received',$6,$7,$8,$9)
+       ON CONFLICT (ref) DO UPDATE SET
+         status='payment_received', transaction_id=$6, enquiry_id=$7,
+         unit_id=$8, unit_label=$9`,
+      [ref, propLabel, buyer_name || '', buyer_phone || '', finalAmount,
+       txnId, enquiry_id || null, unit_id || null, unit_label || '']
     );
-    await logActivity('Payment notification from ' + (buyer_name||'client') + ' for ' + (property_title||property_id) + ' — ref: ' + ref);
-    broadcast('payment_received', { ref, property_id, buyer_name, txnId });
+    await logActivity('Payment notification from ' + (buyer_name||'client') + ' for ' + propLabel + ' ref: ' + ref);
+    broadcast('payment_received', { ref, property_id, unit_id, unit_label, buyer_name, txnId });
     json(res, 200, { success: true, transactionId: txnId, message: 'Payment notification received. Admin will confirm shortly.' });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
@@ -1396,6 +1412,7 @@ const server = http.createServer((req, res) => {
         if (url === '/submit-dispute')         return handleSubmitDispute(data, res);
         // FIX 2: new public endpoint — client notifies payment
         if (url === '/notify-payment')         return handleClientPaymentNotification(data, res);
+        if (url === '/submit-payment')         return handleClientPaymentNotification(data, res); // alias for frontend
 
         if (url === '/owner/login')            return handleOwnerLogin(data, res);
 
