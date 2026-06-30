@@ -891,6 +891,29 @@ async function handleSavePayment(data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// ── Public payment submission — POST /submit-payment ───────────────────────
+// Used by buyers/renters on the public site to record that they made a bank
+// transfer for a property. Unlike /admin/save-payment (staff-only, can set
+// any status), this is intentionally public but always forces status to
+// 'pending' and refuses to overwrite an existing ref, so a site visitor can
+// never self-confirm or self-release a payment — only admin staff can do
+// that via the sales/admin portal, which calls /admin/save-payment.
+async function handleSubmitPayment(data, res) {
+  const { ref, prop, buyer, phone, owner, amount } = data;
+  if (!ref) return json(res, 400, { error: 'Payment ref required' });
+  try {
+    await db.query(
+      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id)
+       VALUES ($1,$2,$3,$4,$5,'',$6,0,0,'pending','',NULL)
+       ON CONFLICT (ref) DO NOTHING`,
+      [ref, prop||'', buyer||'', phone||'', owner||'', amount||0]
+    );
+    await logActivity('Buyer submitted payment for confirmation: ' + ref);
+    broadcast('payment_updated', { ref, status: 'pending' });
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 async function handleGetSync(res) {
   try {
     const [props, regs] = await Promise.all([
@@ -1499,6 +1522,7 @@ const server = http.createServer((req, res) => {
         if (url === '/enquiry')                return handleEnquiry(data, res);
         if (url === '/upload-sign')            return handleSupabaseUploadSign(data, res);
         if (url === '/submit-dispute')         return handleSubmitDispute(data, res);
+        if (url === '/submit-payment')         return handleSubmitPayment(data, res);
 
         if (url === '/owner/login')            return handleOwnerLogin(data, res);
 
