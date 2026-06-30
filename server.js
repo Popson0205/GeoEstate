@@ -1,4 +1,4 @@
-// GeoEstate API Server — Production-ready build v2.1 (patched)
+// GeoEstate API Server — Production-ready build
 // Loads credentials from .env file
 const fs   = require('fs');
 const path = require('path');
@@ -15,6 +15,7 @@ const https = require('https');
 const { Pool } = require('pg');
 
 // ── Crash resilience ───────────────────────────────────────────────────────
+// Crash resilience — keep process alive on unhandled errors.
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception (process kept alive):', err);
 });
@@ -78,9 +79,11 @@ const SALES_TEAM = [
   }
 ];
 const FROM_EMAIL     = 'GeoEstate <noreply@geoestate.com.ng>';
-const sseClients     = new Set();
+const sseClients     = new Set(); // for Server-Sent Events
 
 // ── OTP store (Postgres-backed) ──────────────────────────────────────────────
+// NOTE: OTP codes are stored in Postgres so they survive service restarts.
+// gone away. Storing in Postgres makes it durable across instances.
 async function otpSet(key, code, ttlMs) {
   const expires = new Date(Date.now() + ttlMs);
   await db.query(
@@ -107,6 +110,14 @@ async function otpDelete(key) {
 }
 
 // ── SSE Broadcast ─────────────────────────────────────────────────────────────
+// NOTE: sseClients is per-process. Multiple Railway replicas = use Railway's
+// serverless instance. A write from one instance (e.g. an admin saving a
+// property) cannot reach a browser whose /events connection landed on a
+// different instance — there's no shared memory between them. The frontend's
+// 5s auto-reconnect (geo-api.js) keeps the connection alive in practice, but
+// Redis pub/sub for true fan-out. Single replica works fine for launch.
+// single always-on process. A managed pub/sub (e.g. Pusher/Ably) or polling
+// would be needed for guaranteed real-time sync on serverless hosting.
 function broadcast(eventName, data) {
   const msg = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const client of sseClients) {
@@ -126,43 +137,28 @@ function requireAdmin(req, res) {
   return payload;
 }
 
-// FIX 1: Owner token now uses JWT (same as admin) instead of a fragile
-// "owner:<id>:<timestamp>" string that broke on IDs containing colons.
-// geo-api.js ownerVerifyOTP already stores whatever token the server returns,
-// so this is a pure server-side change — no frontend edits needed.
 function requireOwner(req, res) {
   const auth = req.headers['authorization'] || '';
-  const token = auth.replace(/^Bearer\s+/i, '').trim();
-  if (!token) {
+  const token = auth.replace('Bearer ', '').trim();
+  if (!token || !token.startsWith('owner:')) {
     json(res, 401, { error: 'Owner authentication required' });
     return null;
   }
-
-  // Accept new JWT-style tokens (iss:'owner')
-  const payload = jwtVerify(token, JWT_SECRET);
-  if (payload && payload.iss === 'owner' && payload.sub) {
-    return payload.sub; // userId
-  }
-
-  // Backward-compat: accept legacy "owner:<userId>:<timestamp>" tokens issued
-  // before this patch so existing sessions don't break on redeploy.
-  if (token.startsWith('owner:')) {
-    const parts = token.split(':');
-    if (parts.length >= 3) {
-      const timestamp = parseInt(parts[parts.length - 1]);
-      if (timestamp && !isNaN(timestamp) && Date.now() - timestamp <= 24 * 60 * 60 * 1000) {
-        parts.shift();
-        parts.pop();
-        const userId = parts.join(':');
-        if (userId && userId.length >= 3) return userId;
-      }
-    }
+  // Token format: owner:<userId>:<timestamp>
+  const parts = token.split(':');
+  if (parts.length < 3) { json(res, 401, { error: 'Invalid token format' }); return null; }
+  // Validate timestamp — reject tokens older than 24 hours
+  const timestamp = parseInt(parts[parts.length - 1]);
+  if (!timestamp || isNaN(timestamp) || Date.now() - timestamp > 24 * 60 * 60 * 1000) {
     json(res, 401, { error: 'Token expired. Please log in again.' });
     return null;
   }
-
-  json(res, 401, { error: 'Invalid owner token' });
-  return null;
+  // parts[0]='owner', parts[last]=timestamp, middle = userId
+  parts.shift(); // remove 'owner'
+  parts.pop();   // remove timestamp
+  const userId = parts.join(':');
+  if (!userId || userId.length < 3) { json(res, 401, { error: 'Invalid token' }); return null; }
+  return userId;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -275,6 +271,7 @@ function enquiryEmail(enq, property) {
 </table></td></tr></table></body></html>`;
 }
 
+// ── Sales alert email template ───────────────────────────────────────────────
 function salesAlertEmail(enq, propertyTitle, salesPerson) {
   const waMsg = encodeURIComponent(
     'Hi ' + enq.name + ', I\'m ' + salesPerson.name + ' from GeoEstate Sales. I saw your enquiry about "' + propertyTitle + '" (ID: ' + (enq.property_id||'N/A') + '). I\'d love to help you with this. When is a good time to talk?'
@@ -322,7 +319,7 @@ async function logActivity(msg) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ROUTE HANDLERS
+// PHASE 1 — ROUTE HANDLERS
 // ══════════════════════════════════════════════════════════════
 
 async function handleSendOTP(data, res) {
@@ -330,6 +327,7 @@ async function handleSendOTP(data, res) {
   if (!email || !email.includes('@')) return json(res, 400, { error: 'Valid email required' });
   const code = generateOTP();
 
+  // Step 1: Save OTP to DB — this MUST happen regardless of email outcome
   try {
     await otpSet(email.toLowerCase(), code, 10 * 60 * 1000);
   } catch(dbErr) {
@@ -337,6 +335,8 @@ async function handleSendOTP(data, res) {
     return json(res, 500, { error: 'Could not save verification code. Please try again.' });
   }
 
+  // Step 2: Send email — non-fatal. If Resend isn't configured or domain unverified,
+  // return devCode so the user/developer can complete verification without email.
   const hasResend = !!RESEND_API_KEY;
   if (!hasResend) {
     console.warn('SECRET_RESEND_API_KEY not set — returning devCode for testing');
@@ -347,6 +347,7 @@ async function handleSendOTP(data, res) {
     await sendEmail(email, 'GeoEstate — Your Code: ' + code, otpEmail(code, name || '', purpose || 'register'));
     json(res, 200, { success: true, message: 'Code sent to ' + email });
   } catch(emailErr) {
+    // Email failed (unverified domain, bounce, etc.) — code is in DB, surface devCode
     console.warn('Email send failed:', emailErr.message, '— returning devCode fallback');
     json(res, 200, {
       success: true,
@@ -378,6 +379,11 @@ async function handleVerifyOTP(data, res) {
   }
 }
 
+
+// ── User Login — POST /user/login ────────────────────────────────────────────
+// Validates email + password against registrations table in Neon.
+// Password is stored as base64(password) in the reg payload (same as frontend btoa).
+// Returns the user record on success.
 async function handleUserLogin(data, res) {
   const { email, password } = data;
   if (!email || !password) return json(res, 400, { error: 'Email and password required' });
@@ -388,28 +394,21 @@ async function handleUserLogin(data, res) {
     );
     if (!r.rows.length) return json(res, 401, { error: 'No account found with this email. Please register first.' });
     const user = r.rows[0];
+    // Password stored as btoa(password) by frontend — compare base64
     const expected = Buffer.from(password).toString('base64');
     if (user.pass_hash) {
-      // Accept: base64(plain) match (normal path) OR direct plain match (legacy/edge case)
-      const match = user.pass_hash === expected || user.pass_hash === password;
-      if (!match) {
+      if (user.pass_hash !== expected) {
         return json(res, 401, { error: 'Incorrect password. Please try again.' });
       }
-      // If stored as plain (legacy), upgrade to base64 silently
-      if (user.pass_hash === password && user.pass_hash !== expected) {
-        await db.query('UPDATE registrations SET pass_hash=$1 WHERE id=$2', [expected, user.id]).catch(() => {});
-      }
     } else {
+      // No password stored yet — accept login and save hash for next time
       await db.query(
         'UPDATE registrations SET pass_hash = $1, updated_at = NOW() WHERE id = $2',
         [expected, user.id]
       ).catch(e => console.warn('pass_hash update failed:', e.message));
     }
-    // Issue a JWT so the frontend can use ownerFetch / add-property immediately after login
-    const loginToken = jwtSign({ iss: 'owner', sub: user.id, role: user.role || 'owner', email: user.email }, JWT_SECRET, 8);
     json(res, 200, {
       success: true,
-      token: loginToken,
       user: {
         id:       user.id,
         fname:    user.fname,
@@ -429,17 +428,18 @@ async function handleUserLogin(data, res) {
 async function handleRegister(data, res) {
   const { fname, lname, email, phone, role, id, registeredAt } = data;
   if (!email || !fname) return json(res, 400, { error: 'Name and email required' });
+  // pass is sent as btoa(password) from frontend doRegister()
   const pass_hash = data.pass || null;
-  const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone, nin } = data;
+  const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone, nin } = data; // FIX 2: added nin
   try {
     const exists = await db.query('SELECT id FROM registrations WHERE email = $1', [email.toLowerCase()]);
-    // FIX 2: return submissionId even for existing users so /owner/verify-identity gets the real DB id
-    if (exists.rows.length) return json(res, 200, { success: true, message: 'Already registered', submissionId: exists.rows[0].id });
+    if (exists.rows.length) return json(res, 200, { success: true, message: 'Already registered' });
     const subId = id || ('USR-' + Date.now());
+    // Try full insert with all extended fields, fall back to minimal
     try {
       const { photo_url, id_doc_url, other_doc_url } = data;
       await db.query(
-        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone,nin,photo_url,id_doc_url,other_doc_url,pass_hash)
+        `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials,dob,gender,occupation,employer,state,lga,address,next_of_kin,next_of_kin_rel,next_of_kin_phone,nin,photo_url,id_doc_url,other_doc_url,pass_hash) // FIX 2: nin column added
          VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
         [subId, fname, lname, email.toLowerCase(), phone||'', role||'renter', role||'renter',
          new Date().toLocaleString('en-NG'), registeredAt||new Date().toISOString(),
@@ -447,10 +447,11 @@ async function handleRegister(data, res) {
          dob||'—', gender||'—', occupation||'—', employer||'—',
          regState||'—', regLga||'—', regAddress||'—',
          next_of_kin||'—', next_of_kin_rel||'—', next_of_kin_phone||'—',
-         nin||'',
+         nin||'', // FIX: nin now saved
          photo_url||null, id_doc_url||null, other_doc_url||null, pass_hash||null]
       );
     } catch(e1) {
+      // Fallback: minimal insert if extended columns missing
       await db.query(
         `INSERT INTO registrations (id,fname,lname,email,phone,role,type,status,submitted,registered_at,initials)
          VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10)`,
@@ -462,14 +463,14 @@ async function handleRegister(data, res) {
     await logActivity('New registration: ' + fname + ' ' + lname + ' (' + (role==='owner'?'Owner':'Renter') + ')');
     sendEmail('admin@geoestate.com.ng', '🆕 New Registration: ' + fname + ' ' + lname, adminAlertEmail({fname,lname,email,phone,role,id:subId}))
       .catch(e => console.warn('Admin alert failed:', e.message));
-    const regToken = jwtSign({ iss: 'owner', sub: subId, role: role || 'renter', email: email.toLowerCase() }, JWT_SECRET, 8);
-    json(res, 200, { success: true, submissionId: subId, token: regToken });
+    json(res, 200, { success: true, submissionId: subId });
   } catch(e) {
     console.error('Register error:', e.message);
     json(res, 500, { error: e.message });
   }
 }
 
+// ── Public Properties (with type filter) ──
 async function handlePublicProperties(urlFull, res) {
   try {
     const params = new URL('http://x' + urlFull).searchParams;
@@ -477,7 +478,7 @@ async function handlePublicProperties(urlFull, res) {
     const state  = params.get('state');
     const search = params.get('q');
 
-    let query = "SELECT id, title, owner, owner_id, type, COALESCE(listing_type, type, 'rent') as listing_type, status, price, state, lga, address, img, COALESCE(images, '[]'::jsonb) as images, COALESCE(lat, NULL) as lat, COALESCE(lng, NULL) as lng, COALESCE(geo, false) as geo, created_at FROM properties WHERE status='live'";
+    let query = "SELECT id, title, owner, owner_id, type, COALESCE(listing_type, type, 'rent') as listing_type, status, price, state, lga, address, img, created_at FROM properties WHERE status='live'";
     const args = [];
 
     if (typeFilter) {
@@ -498,6 +499,7 @@ async function handlePublicProperties(urlFull, res) {
     try {
       result = await db.query(query, args);
     } catch(e1) {
+      // listing_type column missing — use type only
       let q2 = "SELECT id, title, owner, type, type as listing_type, status, price, state, lga, address, img, created_at FROM properties WHERE status='live'";
       const args2 = [];
       if (typeFilter) { args2.push(typeFilter); q2 += ' AND type=$' + args2.length; }
@@ -508,6 +510,7 @@ async function handlePublicProperties(urlFull, res) {
     json(res, 200, { success: true, count: result.rows.length, properties: result.rows });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
+
 
 async function handlePublicPropertyById(id, res) {
   try {
@@ -524,6 +527,7 @@ async function handlePublicPropertyById(id, res) {
       if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
       prop = r.rows[0];
     }
+    // Try units
     try {
       const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status,occupied_since,lease_end FROM property_units WHERE property_id=$1 ORDER BY unit_label", [id]);
       prop.units = ur.rows;
@@ -531,6 +535,7 @@ async function handlePublicPropertyById(id, res) {
     json(res, 200, { success: true, property: prop });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
+
 
 async function handleGetRegistrations(url, res) {
   try {
@@ -552,10 +557,7 @@ async function handleGetRegistrations(url, res) {
       doc: r.doc||'Pending upload', notes: r.notes||'',
       nextOfKin: r.next_of_kin||'—', nextOfKinRel: r.next_of_kin_rel||'—',
       nextOfKinPhone: r.next_of_kin_phone||'—',
-      isVerified: r.is_verified||false,
-      verified_at: r.verified_at||null, updated_at: r.updated_at||null,
-      // FIX 3: expose upload URLs so admin card can show selfie/doc previews
-      photo_url: r.photo_url||null, id_doc_url: r.id_doc_url||null
+      isVerified: r.is_verified||false
     }));
     json(res, 200, { success: true, count: rows.length, registrations: rows });
   } catch(e) { json(res, 500, { error: e.message }); }
@@ -563,11 +565,12 @@ async function handleGetRegistrations(url, res) {
 
 async function handleGetProperties(res) {
   try {
+    // Use safe column list that works with both old and new schema
     const result = await db.query(`
       SELECT id, title, owner, owner_id, type,
         COALESCE(listing_type, type, 'rent') as listing_type,
         status, price,
-        COALESCE(monthly_rent, NULL) as monthly_rent,
+        COALESCE(monthly_rent, CASE WHEN type='rent' THEN NULL ELSE NULL END) as monthly_rent,
         COALESCE(sale_price, NULL) as sale_price,
         COALESCE(lease_price, NULL) as lease_price,
         state, lga, address, img,
@@ -577,17 +580,12 @@ async function handleGetProperties(res) {
         COALESCE(size_sqm, NULL) as size_sqm,
         COALESCE(description, '') as description,
         COALESCE(amenities, '[]'::jsonb) as amenities,
-        COALESCE(docs, '[]'::jsonb) as docs,
-        COALESCE(geo, false) as geo,
-        COALESCE(lawyer_req, false) as lawyer_req,
-        lawyer_assigned,
-        COALESCE(lat, NULL) as lat,
-        COALESCE(lng, NULL) as lng,
         notes, submitted, created_at, updated_at
       FROM properties ORDER BY created_at DESC
     `);
     json(res, 200, { success: true, count: result.rows.length, properties: result.rows });
   } catch(e) {
+    // Fallback: minimal safe query if new columns don't exist yet
     try {
       const r2 = await db.query('SELECT id,title,owner,type,type as listing_type,status,price,state,lga,address,img,notes,submitted,created_at FROM properties ORDER BY created_at DESC');
       json(res, 200, { success: true, count: r2.rows.length, properties: r2.rows });
@@ -642,26 +640,19 @@ async function handleAdminUpdate(url, data, res) {
     const id = regMatch[1];
     const { status, reviewer, notes } = data;
     try {
-      // Set verified_at timestamp when approving identity
-      if (status === 'approved') {
-        await db.query(
-          'UPDATE registrations SET status=$1, reviewer=$2, notes=$3, updated_at=NOW(), verified_at=NOW() WHERE id=$4',
-          [status, reviewer||'Admin', notes||'', id]
-        );
-      } else {
-        await db.query(
-          'UPDATE registrations SET status=$1, reviewer=$2, notes=$3, updated_at=NOW() WHERE id=$4',
-          [status, reviewer||'Admin', notes||'', id]
-        );
-      }
+      await db.query(
+        'UPDATE registrations SET status=$1, reviewer=$2, notes=$3, updated_at=NOW() WHERE id=$4',
+        [status, reviewer||'Admin', notes||'', id]
+      );
+      // If approved as owner, ensure owner capability
       if (status === 'approved') {
         try {
           await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
         } catch(verifyErr) {
+          // is_verified column may not exist yet — add it and retry
           try {
             await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE");
             await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS owner_since TIMESTAMPTZ");
-            await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ");
             await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
           } catch(e2) { console.warn('is_verified column fix failed:', e2.message); }
         }
@@ -677,7 +668,7 @@ async function handleAdminUpdate(url, data, res) {
   if (propMatch) {
     const id = propMatch[1];
     try {
-      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo','lat','lng'];
+      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo'];
       const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
       if (!fields.length) return json(res, 400, { error: 'No valid fields' });
       const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');
@@ -720,6 +711,7 @@ async function handleAdminUpdate(url, data, res) {
     return;
   }
 
+
   json(res, 404, { error: 'Unknown admin update endpoint' });
 }
 
@@ -729,6 +721,7 @@ async function handleSaveProperty(data, res) {
   const propId = id || ('PROP-' + Date.now());
   const lt = listing_type || type || 'rent';
   try {
+    // Try new schema first, fall back to basic insert if columns missing
     try {
       await db.query(
         `INSERT INTO properties (id,title,owner,owner_id,type,status,price,state,lga,address,img,notes,submitted)
@@ -736,10 +729,11 @@ async function handleSaveProperty(data, res) {
          ON CONFLICT (id) DO UPDATE SET title=$2,owner=$3,type=$5,status=$6,price=$7,state=$8,lga=$9,address=$10,img=$11,notes=$12,updated_at=NOW()`,
         [propId,title,owner||'',owner_id||null,lt,status||'pending',price||'',state||'',lga||'',address||'',img||'',notes||'',new Date().toLocaleString('en-NG')]
       );
+      // Try to update new columns separately (safe if they don't exist yet)
       await db.query(
         `UPDATE properties SET listing_type=$1,monthly_rent=$2,sale_price=$3,lease_price=$4,images=$5,bedrooms=$6,bathrooms=$7,size_sqm=$8,description=$9,amenities=$10 WHERE id=$11`,
         [lt,monthly_rent||null,sale_price||null,lease_price||null,JSON.stringify(images||[]),bedrooms||null,bathrooms||null,size_sqm||null,description||'',JSON.stringify(amenities||[]),propId]
-      ).catch(()=>{});
+      ).catch(()=>{}); // Silent fail if columns missing — run schema.sql to enable
     } catch(e2) { throw e2; }
     await logActivity((id ? 'Property updated: ' : 'Property added: ') + title);
     broadcast('property_created', { id: propId, title, listing_type: lt });
@@ -789,6 +783,7 @@ async function handleSaveTenancy(data, res) {
        ON CONFLICT (ref) DO NOTHING`,
       [ref||('TEN-'+Date.now()),type||'rent',property,property_id||null,unit_id||null,tenant,tenant_id||null,phone||'',owner||'',amount||0,start,end,notes||'']
     );
+    // If unit_id provided, mark unit as occupied
     if (unit_id) {
       await db.query("UPDATE property_units SET status='occupied', current_tenant_id=$1, occupied_since=$2, lease_end=$3 WHERE id=$4",
         [tenant_id||null, start, end, unit_id]);
@@ -853,11 +848,13 @@ async function handleSubmitDispute(data, res) {
 async function handleUpdateDispute(id, data, res) {
   const { status, lawyerAssigned, npfFiled, notes } = data;
   try {
+    // Try full update first, fall back without notes column if missing
     try {
       await db.query('UPDATE disputes SET status=$1, lawyer_assigned=$2, npf_filed=$3, notes=COALESCE($4,notes) WHERE id=$5',
         [status||'active', lawyerAssigned||'', npfFiled||false, notes||null, id]);
     } catch(e1) {
       if (e1.message && e1.message.includes('notes')) {
+        // Add notes column then retry
         await db.query("ALTER TABLE disputes ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''");
         await db.query('UPDATE disputes SET status=$1, lawyer_assigned=$2, npf_filed=$3 WHERE id=$4',
           [status||'active', lawyerAssigned||'', npfFiled||false, id]);
@@ -887,29 +884,6 @@ async function handleSavePayment(data, res) {
     );
     await logActivity('Payment ' + (status||'pending') + ': ' + ref);
     broadcast('payment_updated', { ref, status });
-    json(res, 200, { success: true });
-  } catch(e) { json(res, 500, { error: e.message }); }
-}
-
-// ── Public payment submission — POST /submit-payment ───────────────────────
-// Used by buyers/renters on the public site to record that they made a bank
-// transfer for a property. Unlike /admin/save-payment (staff-only, can set
-// any status), this is intentionally public but always forces status to
-// 'pending' and refuses to overwrite an existing ref, so a site visitor can
-// never self-confirm or self-release a payment — only admin staff can do
-// that via the sales/admin portal, which calls /admin/save-payment.
-async function handleSubmitPayment(data, res) {
-  const { ref, prop, buyer, phone, owner, amount } = data;
-  if (!ref) return json(res, 400, { error: 'Payment ref required' });
-  try {
-    await db.query(
-      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id)
-       VALUES ($1,$2,$3,$4,$5,'',$6,0,0,'pending','',NULL)
-       ON CONFLICT (ref) DO NOTHING`,
-      [ref, prop||'', buyer||'', phone||'', owner||'', amount||0]
-    );
-    await logActivity('Buyer submitted payment for confirmation: ' + ref);
-    broadcast('payment_updated', { ref, status: 'pending' });
     json(res, 200, { success: true });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
@@ -944,25 +918,26 @@ async function handleSaveTransaction(data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
-// ── Owner Auth ────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// PHASE 2 — OWNER LAYER
+// ══════════════════════════════════════════════════════════════
+
 async function handleOwnerLogin(data, res) {
   const { email, code } = data;
   if (!email) return json(res, 400, { error: 'Email required' });
   const key = 'owner:' + email.toLowerCase();
 
+  // If just requesting OTP
   if (!code) {
     const otpCode = generateOTP();
     try {
       await otpSet(key, otpCode, 10 * 60 * 1000);
-      // Non-fatal if email fails
-      if (RESEND_API_KEY) {
-        sendEmail(email, 'GeoEstate Owner Login — Code: ' + otpCode, otpEmail(otpCode, '', 'owner-login'))
-          .catch(e => console.warn('Owner OTP email failed:', e.message));
-      }
-      return json(res, 200, { success: true, message: 'Code sent to ' + email, ...(RESEND_API_KEY ? {} : { testMode: true, devCode: otpCode }) });
+      await sendEmail(email, 'GeoEstate Owner Login — Code: ' + otpCode, otpEmail(otpCode, '', 'owner-login'));
+      return json(res, 200, { success: true, message: 'Code sent' });
     } catch(e) { return json(res, 500, { error: e.message }); }
   }
 
+  // Verify OTP
   let record;
   try { record = await otpGet(key); } catch(e) { return json(res, 500, { error: e.message }); }
   if (!record) return json(res, 400, { error: 'No code found. Request a new one.' });
@@ -970,6 +945,7 @@ async function handleOwnerLogin(data, res) {
   if (code !== record.code) { await otpIncrementAttempts(key); return json(res, 400, { error: 'Incorrect code.' }); }
   await otpDelete(key);
 
+  // Find user — accept any registered email, owner role not strictly required
   try {
     const r = await db.query('SELECT * FROM registrations WHERE email=$1', [email.toLowerCase()]);
     if (!r.rows.length) return json(res, 404, {
@@ -977,12 +953,12 @@ async function handleOwnerLogin(data, res) {
       hint: 'Visit geoestate.com.ng and complete the registration form before logging in here.'
     });
     const u = r.rows[0];
+    // Auto-upgrade role to owner if they're logging into owner portal
     if (u.role !== 'owner') {
       await db.query("UPDATE registrations SET role='owner', type='owner', updated_at=NOW() WHERE id=$1", [u.id]);
       u.role = 'owner';
     }
-    // FIX 4: Issue a proper JWT for the owner (8h expiry, same signing key)
-    const token = jwtSign({ iss: 'owner', sub: u.id, role: 'owner', email: u.email }, JWT_SECRET, 8);
+    const token = 'owner:' + u.id + ':' + Date.now();
     json(res, 200, {
       success: true,
       token,
@@ -1006,18 +982,16 @@ async function handleOwnerProfile(ownerId, res) {
 
 async function handleOwnerVerifyIdentity(ownerId, data, res) {
   try {
+    // Check if already verified
     const r = await db.query('SELECT is_verified FROM registrations WHERE id=$1', [ownerId]);
     if (r.rows[0]?.is_verified) return json(res, 200, { success: true, alreadyVerified: true, message: 'Already verified — no action needed.' });
 
     const { nin, doc_type, doc_url, selfie_url, dob, gender, occupation, employer, state, lga, address, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
-    // FIX 5: also save selfie_url / photo_url from the new verify-identity form
-    const photoUrl = data.photo_url || selfie_url || null;
+    // Try full update with all fields, fall back to minimal if columns missing
     try {
       await db.query(
         `UPDATE registrations SET
           nin=$1, doc=$2, is_verified=false, status=$3,
-          photo_url=COALESCE($15, photo_url),
-          id_doc_url=COALESCE($16, id_doc_url),
           dob=COALESCE(NULLIF($5,''),dob),
           gender=COALESCE(NULLIF($6,''),gender),
           occupation=COALESCE(NULLIF($7,''),occupation),
@@ -1033,10 +1007,10 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
         [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId,
          dob||'', gender||'', occupation||'', employer||'',
          state||'', lga||'', address||'',
-         next_of_kin||'', next_of_kin_rel||'', next_of_kin_phone||'',
-         photoUrl, doc_url||null]
+         next_of_kin||'', next_of_kin_rel||'', next_of_kin_phone||'']
       );
     } catch(e) {
+      // Fallback: minimal update if extended columns don't exist
       await db.query(
         'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, updated_at=NOW() WHERE id=$4',
         [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId]
@@ -1059,11 +1033,14 @@ async function handleOwnerProperties(ownerId, urlFull, res) {
     try {
       result = await db.query(q, args);
     } catch(e1) {
+      // Fallback without listing_type
       let q2 = 'SELECT id,title,owner,type,type as listing_type,status,price,state,lga,address,img,created_at FROM properties WHERE owner_id=$1';
       const a2 = [ownerId];
       if (type) { a2.push(type); q2 += ' AND type=$' + a2.length; }
       result = await db.query(q2, a2);
     }
+    // Add unit counts
+    // Add unit counts from DB
     let rows = result.rows;
     try {
       const ucRes = await db.query(
@@ -1080,33 +1057,37 @@ async function handleOwnerProperties(ownerId, urlFull, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+
 async function handleOwnerAddProperty(ownerId, data, res) {
+  // Check verification
   let vrRow;
   try {
     const vr = await db.query('SELECT is_verified, status FROM registrations WHERE id=$1', [ownerId]);
     if (!vr.rows.length) return json(res, 404, { error: 'Owner not found' });
     vrRow = vr.rows[0];
   } catch(e) {
+    // Fallback if is_verified column missing — check status only
     const vr2 = await db.query('SELECT status FROM registrations WHERE id=$1', [ownerId]);
     if (!vr2.rows.length) return json(res, 404, { error: 'Owner not found' });
     vrRow = { is_verified: vr2.rows[0].status === 'approved', status: vr2.rows[0].status };
   }
+  // Allow listing if verified OR if admin has approved the account
   if (!vrRow.is_verified && vrRow.status !== 'approved') return json(res, 403, {
     error: 'Identity not yet verified',
     needsVerification: true,
     message: 'Please complete identity verification to list properties. You only need to do this once.'
   });
 
-  const { title, listing_type, price, monthly_rent, sale_price, lease_price, state, lga, address, img, images, bedrooms, bathrooms, size_sqm, description, amenities, notes, lat, lng, geo } = data;
+  const { title, listing_type, price, monthly_rent, sale_price, lease_price, state, lga, address, img, images, bedrooms, bathrooms, size_sqm, description, amenities, notes } = data;
   if (!title) return json(res, 400, { error: 'Property title required' });
   if (!listing_type || !['rent','buy','lease'].includes(listing_type)) return json(res, 400, { error: 'listing_type must be rent, buy, or lease' });
 
   const propId = 'PROP-' + Date.now();
   try {
     await db.query(
-      `INSERT INTO properties (id,title,owner_id,owner,listing_type,type,status,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,size_sqm,description,amenities,notes,submitted,lat,lng,geo)
-       VALUES ($1,$2,$3,(SELECT fname||' '||lname FROM registrations WHERE id=$3),$4,$4,'pending',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
-      [propId, title, ownerId, listing_type, price||'', monthly_rent||null, sale_price||null, lease_price||null, state||'', lga||'', address||'', img||'', JSON.stringify(images||[]), bedrooms||null, bathrooms||null, size_sqm||null, description||'', JSON.stringify(amenities||[]), notes||'', new Date().toLocaleString('en-NG'), (lat!=null ? lat : null), (lng!=null ? lng : null), !!geo]
+      `INSERT INTO properties (id,title,owner_id,owner,listing_type,type,status,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,size_sqm,description,amenities,notes,submitted)
+       VALUES ($1,$2,$3,(SELECT fname||' '||lname FROM registrations WHERE id=$3),$4,$4,'pending',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+      [propId, title, ownerId, listing_type, price||'', monthly_rent||null, sale_price||null, lease_price||null, state||'', lga||'', address||'', img||'', JSON.stringify(images||[]), bedrooms||null, bathrooms||null, size_sqm||null, description||'', JSON.stringify(amenities||[]), notes||'', new Date().toLocaleString('en-NG')]
     );
     await logActivity('Owner ' + ownerId + ' listed new property: ' + title);
     json(res, 200, { success: true, propertyId: propId, message: 'Property submitted for review. It will go live once approved.' });
@@ -1114,10 +1095,11 @@ async function handleOwnerAddProperty(ownerId, data, res) {
 }
 
 async function handleOwnerUpdateProperty(ownerId, propId, data, res) {
+  // Verify ownership
   const own = await db.query('SELECT id FROM properties WHERE id=$1 AND owner_id=$2', [propId, ownerId]);
   if (!own.rows.length) return json(res, 403, { error: 'Property not found or not yours' });
   try {
-    const allowed = ['title','listing_type','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lat','lng','geo'];
+    const allowed = ['title','listing_type','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes'];
     const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
     if (!fields.length) return json(res, 400, { error: 'No valid fields' });
     const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');
@@ -1149,34 +1131,18 @@ async function handleOwnerEnquiries(ownerId, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
-async function handleOwnerPropertyDetail(ownerId, propId, res) {
-  try {
-    const r = await db.query(
-      `SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,
-       COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,
-       state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,
-       COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,
-       COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at
-       FROM properties WHERE id=$1 AND owner_id=$2`,
-      [propId, ownerId]
-    );
-    if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
-    const prop = r.rows[0];
-    try {
-      const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status FROM property_units WHERE property_id=$1 ORDER BY unit_label", [propId]);
-      prop.units = ur.rows;
-    } catch(e) { prop.units = []; }
-    json(res, 200, { success: true, property: prop });
-  } catch(e) { json(res, 500, { error: e.message }); }
-}
+// ══════════════════════════════════════════════════════════════
+// PHASE 3 — UNIT / ROOM MANAGEMENT
+// ══════════════════════════════════════════════════════════════
 
-// ── Unit management ───────────────────────────────────────────────────────────
 async function handleGetUnits(ownerId, propId, res) {
+  // Verify ownership if ownerId provided
   if (ownerId) {
     const own = await db.query('SELECT id FROM properties WHERE id=$1 AND owner_id=$2', [propId, ownerId]);
     if (!own.rows.length) return json(res, 403, { error: 'Property not found or not yours' });
   }
   try {
+    // Auto-create table if missing
     await db.query(`CREATE TABLE IF NOT EXISTS property_units (
       id SERIAL PRIMARY KEY, property_id TEXT REFERENCES properties(id) ON DELETE CASCADE,
       unit_label VARCHAR(100) NOT NULL, unit_type VARCHAR(50) DEFAULT 'room',
@@ -1190,25 +1156,11 @@ async function handleGetUnits(ownerId, propId, res) {
     r.rows.forEach(u => { if (stats[u.status] !== undefined) stats[u.status]++; });
     json(res, 200, { success: true, units: r.rows, stats });
   } catch(e) {
+    // Table might not exist yet — return empty gracefully
     if (e.message && e.message.includes('does not exist')) {
       json(res, 200, { success: true, units: [], stats: { total:0,vacant:0,occupied:0,reserved:0,maintenance:0 }, note: 'Run schema.sql to enable unit management' });
     } else { json(res, 500, { error: e.message }); }
   }
-}
-
-async function handleAdminGetUnits(propId, res) {
-  try {
-    await db.query(`CREATE TABLE IF NOT EXISTS property_units (
-      id SERIAL PRIMARY KEY, property_id TEXT REFERENCES properties(id) ON DELETE CASCADE,
-      unit_label VARCHAR(100) NOT NULL, unit_type VARCHAR(50) DEFAULT 'room',
-      floor_level VARCHAR(20) DEFAULT '', capacity INTEGER DEFAULT 1,
-      monthly_price NUMERIC, status VARCHAR(20) DEFAULT 'vacant',
-      current_tenant_id TEXT, occupied_since DATE, lease_end DATE,
-      notes TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-    )`).catch(()=>{});
-    const r = await db.query('SELECT * FROM property_units WHERE property_id=$1 ORDER BY unit_label', [propId]);
-    json(res, 200, { success: true, units: r.rows });
-  } catch(e) { json(res, 500, { error: e.message }); }
 }
 
 async function handleAddUnit(ownerId, propId, data, res) {
@@ -1258,12 +1210,33 @@ async function handleDeleteUnit(ownerId, propId, unitId, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
-// ── Enquiry ───────────────────────────────────────────────────────────────────
+// Admin unit management
+async function handleAdminGetUnits(propId, res) {
+  try {
+    // Auto-create table if missing
+    await db.query(`CREATE TABLE IF NOT EXISTS property_units (
+      id SERIAL PRIMARY KEY, property_id TEXT REFERENCES properties(id) ON DELETE CASCADE,
+      unit_label VARCHAR(100) NOT NULL, unit_type VARCHAR(50) DEFAULT 'room',
+      floor_level VARCHAR(20) DEFAULT '', capacity INTEGER DEFAULT 1,
+      monthly_price NUMERIC, status VARCHAR(20) DEFAULT 'vacant',
+      current_tenant_id TEXT, occupied_since DATE, lease_end DATE,
+      notes TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`).catch(()=>{});
+    const r = await db.query('SELECT * FROM property_units WHERE property_id=$1 ORDER BY unit_label', [propId]);
+    json(res, 200, { success: true, units: r.rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// ══════════════════════════════════════════════════════════════
+// PHASE 4 — ENQUIRY, SEARCH, SSE
+// ══════════════════════════════════════════════════════════════
+
 async function handleEnquiry(data, res) {
   const { property_id, property_title, name, email, phone, message, unit_id } = data;
   if (!property_id || !name || !email) return json(res, 400, { error: 'property_id, name and email required' });
   const id = 'ENQ-' + Date.now();
   try {
+    // Create enquiries table if not exists (idempotent)
     await db.query(`CREATE TABLE IF NOT EXISTS enquiries (
       id TEXT PRIMARY KEY, property_id TEXT, unit_id INTEGER,
       name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT DEFAULT '',
@@ -1272,9 +1245,11 @@ async function handleEnquiry(data, res) {
       property_title TEXT DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`).catch(()=>{});
+    // Ensure all columns exist on older tables
     await db.query("ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT ''").catch(()=>{});
     await db.query("ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS assigned_to TEXT DEFAULT ''").catch(()=>{});
     await db.query("ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS property_title TEXT DEFAULT ''").catch(()=>{});
+    // Resolve property title: use submitted title, or look up from DB
     let resolvedTitle = property_title || '';
     if (!resolvedTitle) {
       const tR = await db.query('SELECT title FROM properties WHERE id=$1', [property_id]).catch(()=>({ rows: [] }));
@@ -1284,21 +1259,24 @@ async function handleEnquiry(data, res) {
       'INSERT INTO enquiries (id,property_id,unit_id,name,email,phone,message,property_title) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
       [id, property_id, unit_id||null, name, email, phone||'', message||'', resolvedTitle]
     );
+    // Notify owner
     const propR = await db.query('SELECT title, owner_id, (SELECT email FROM registrations WHERE id=properties.owner_id) as owner_email FROM properties WHERE id=$1', [property_id]);
-    const propTitle = propR.rows[0]?.title || resolvedTitle || 'Property';
+    const propTitle = propR.rows[0]?.title || resolvedTitle || property_title || 'Property';
     if (propR.rows[0]?.owner_email) {
       sendEmail(propR.rows[0].owner_email, '📬 New Enquiry: ' + propTitle, enquiryEmail({name,email,phone,message}, propTitle))
-        .catch(e => console.warn('Enquiry owner email failed:', e.message));
+        .catch(e => console.warn('Enquiry email failed:', e.message));
     }
+    // Notify all sales team members instantly
     for (const sm of SALES_TEAM) {
       sendEmail(
         sm.email,
         '🔔 New Lead: ' + name + ' — ' + propTitle,
-        salesAlertEmail({name, email, phone: phone||'—', message: message||'', property_id}, propTitle, sm)
+        salesAlertEmail({name, email, phone: phone||'—', message: message||''}, propTitle, sm)
       ).catch(e => console.warn('Sales alert email failed for ' + sm.email + ':', e.message));
     }
     await logActivity('Enquiry received for property ' + property_id + ' from ' + name);
     broadcast('new_enquiry', { property_id, name });
+    // Return sales contact info to frontend
     json(res, 200, {
       success: true,
       enquiryId: id,
@@ -1319,136 +1297,63 @@ async function handleGetAdminEnquiries(res) {
     `);
     json(res, 200, { success: true, enquiries: r.rows });
   } catch(e) {
+    // Enquiries table may not exist yet — return empty gracefully
     if (e.message && (e.message.includes('does not exist') || e.message.includes('relation'))) {
       json(res, 200, { success: true, enquiries: [], note: 'Run schema.sql to enable enquiries' });
     } else { json(res, 500, { error: e.message }); }
   }
 }
 
-// ── SSE ───────────────────────────────────────────────────────────────────────
+// ── SSE endpoint ──
 function handleSSE(req, res) {
+  // NOTE: do NOT set a 'Connection' header here. It's a hop-by-hop header
+  // forbidden under HTTP/2 — if the host's edge/proxy terminates the client
+  // connection as HTTP/2 (e.g. Railway), forwarding this header causes
+  // Chrome to kill the stream with ERR_HTTP2_PROTOCOL_ERROR on every attempt.
   res.writeHead(200, {
-    'Content-Type':      'text/event-stream',
-    'Cache-Control':     'no-cache',
-    'Connection':        'keep-alive',
-    'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': '*'
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Access-Control-Allow-Origin': '*',
+    'X-Accel-Buffering': 'no' // disable proxy buffering (nginx and similar) so events flush immediately
   });
   res.write('data: {"type":"connected"}\n\n');
   sseClients.add(res);
-  // 15s ping keeps Railway HTTP/2 proxy from resetting idle SSE streams
+  // Keep-alive ping every 30s
   const ping = setInterval(() => {
     try { res.write(':ping\n\n'); } catch(e) { clearInterval(ping); sseClients.delete(res); }
-  }, 15000);
+  }, 30000);
   req.on('close', () => { clearInterval(ping); sseClients.delete(res); });
 }
 
-// ── Supabase signed upload URL ────────────────────────────────────────────────
-// FIX 6: Return upload_url (PUT target) and public_url — frontend uses upload_url.
-async function handleSupabaseUploadSign(data, res) {
-  const SUPABASE_URL         = process.env.SUPABASE_URL;
-  const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-  const BUCKET               = process.env.SUPABASE_BUCKET || 'geoestate-docs';
-
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    return json(res, 503, { error: 'Storage not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in Railway environment variables.' });
-  }
-
-  const folder   = (data.folder || 'uploads').replace(/[^a-zA-Z0-9/_-]/g, '');
-  const ext      = (data.ext || (data.filename ? data.filename.split('.').pop() : 'bin')).toLowerCase();
-  const filename = folder + '/' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.' + ext;
-
-  try {
-    const signRes = await fetch(
-      `${SUPABASE_URL}/storage/v1/object/upload/sign/${BUCKET}/${filename}`,
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ upsert: false })
-      }
-    );
-    if (!signRes.ok) {
-      const err = await signRes.text();
-      return json(res, 500, { error: 'Could not create signed URL: ' + err });
-    }
-    const signData = await signRes.json();
-    const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${filename}`;
-    // FIX 6: expose upload_url so legacy callers (owner-dashboard) work too
-    const uploadUrl = SUPABASE_URL + '/storage/v1' + signData.url;
-    json(res, 200, {
-      signed_url:  uploadUrl,  // used by new doRegister / geoUploadToSupabase
-      upload_url:  uploadUrl,  // used by legacy ownerCloudinaryUpload calls
-      public_url:  publicUrl,
-      token:       signData.token,
-      path:        filename,
-      bucket:      BUCKET
-    });
-  } catch(e) {
-    json(res, 500, { error: e.message });
-  }
-}
-
-// ── Admin Login ───────────────────────────────────────────────────────────────
-async function handleAdminLogin(data, res) {
-  const { email, password } = data;
-  if (!email || !password) return json(res, 400, { error: 'Email and password required' });
-
-  function safeEqual(a, b) {
-    const ba = Buffer.from(a);
-    const bb = Buffer.from(b);
-    const maxLen = Math.max(ba.length, bb.length);
-    const pa = Buffer.concat([ba, Buffer.alloc(maxLen - ba.length)]);
-    const pb = Buffer.concat([bb, Buffer.alloc(maxLen - bb.length)]);
-    return crypto.timingSafeEqual(pa, pb) && ba.length === bb.length;
-  }
-  const emailOk    = safeEqual(email.toLowerCase().trim(), ADMIN_EMAIL.toLowerCase().trim());
-  const passwordOk = safeEqual(password, ADMIN_PASSWORD);
-
-  if (!emailOk || !passwordOk) {
-    await new Promise(r => setTimeout(r, 500));
-    return json(res, 401, { error: 'Invalid email or password' });
-  }
-
-  const token = jwtSign({ role: 'admin', email: ADMIN_EMAIL }, JWT_SECRET, 8);
-  await logActivity('Admin login: ' + ADMIN_EMAIL).catch(() => {});
-  json(res, 200, { success: true, token, expiresIn: '8h' });
-}
-
-async function handleAdminLogout(req, res) {
-  await logActivity('Admin logout').catch(() => {});
-  json(res, 200, { success: true });
-}
-
-// ══════════════════════════════════════════════════════════════
-// HTTP SERVER — ROUTER
-// ══════════════════════════════════════════════════════════════
+// ── HTTP Server ───────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Token');
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
-  // FIX 7: strip trailing slash so /admin/login/ works same as /admin/login
-  const url     = req.url.split('?')[0].replace(/\/$/, '') || '/';
+  const url     = req.url.split('?')[0];
   const urlFull = req.url;
 
+  // ── GET routes ──
   if (req.method === 'GET') {
     if (url === '/')
-      return db.query('SELECT COUNT(*) FROM registrations').then(r => json(res,200,{status:'ok',service:'GeoEstate API',version:'2.1',db:'supabase',registrations:r.rows[0].count})).catch(()=>json(res,200,{status:'ok',service:'GeoEstate API',version:'2.1'}));
-    if (url === '/health') return json(res, 200, { status: 'ok', service: 'GeoEstate API', version: '2.1' });
+      return db.query('SELECT COUNT(*) FROM registrations').then(r => json(res,200,{status:'ok',service:'GeoEstate API',version:'2.0',db:'neon',registrations:r.rows[0].count})).catch(()=>json(res,200,{status:'ok',service:'GeoEstate API',version:'2.0'}));
+    if (url === '/health') return json(res, 200, { status: 'ok', service: 'GeoEstate API', version: '2.0' });
 
+
+    // Public — no auth required
     if (url === '/properties')               return handlePublicProperties(urlFull, res);
     if (url.match(/^\/properties\/([^/]+)$/)) return handlePublicPropertyById(url.split('/')[2], res);
     if (url === '/events')                   return handleSSE(req, res);
 
+    // Admin routes — require token
     if (url.startsWith('/admin/')) {
       if (!requireAdmin(req, res)) return;
       if (url === '/admin/me') {
-        const payload = jwtVerify((req.headers['authorization']||'').replace(/^Bearer\s+/i,'').trim(), JWT_SECRET);
-        if (!payload) return json(res, 401, { error: 'Invalid token' });
+        const payload = requireAdmin(req, res);
+        if (!payload) return;
         return json(res, 200, { success: true, email: payload.email, role: payload.role });
       }
       if (url === '/admin/registrations')    return handleGetRegistrations(urlFull, res);
@@ -1467,6 +1372,7 @@ const server = http.createServer((req, res) => {
       return json(res, 404, { error: 'Not found' });
     }
 
+    // Owner routes
     if (url.startsWith('/owner/')) {
       const ownerId = requireOwner(req, res);
       if (!ownerId) return;
@@ -1483,6 +1389,7 @@ const server = http.createServer((req, res) => {
     return json(res, 404, { error: 'Not found' });
   }
 
+  // ── DELETE routes ──
   if (req.method === 'DELETE') {
     if (url.startsWith('/admin/')) {
       if (!requireAdmin(req, res)) return;
@@ -1506,6 +1413,7 @@ const server = http.createServer((req, res) => {
     return json(res, 404, { error: 'Not found' });
   }
 
+  // ── POST / PATCH routes ──
   if (req.method === 'POST' || req.method === 'PATCH') {
     let body = '';
     req.on('data', c => body += c);
@@ -1513,19 +1421,21 @@ const server = http.createServer((req, res) => {
       try {
         const data = body ? JSON.parse(body) : {};
 
+        // Public endpoints
         if (url === '/admin/login')            return handleAdminLogin(data, res);
         if (url === '/admin/logout')           return handleAdminLogout(req, res);
-        if (url === '/send-otp')               return handleSendOTP(data, res);
-        if (url === '/verify-otp')             return handleVerifyOTP(data, res);
-        if (url === '/register')               return handleRegister(data, res);
-        if (url === '/user/login')             return handleUserLogin(data, res);
-        if (url === '/enquiry')                return handleEnquiry(data, res);
-        if (url === '/upload-sign')            return handleSupabaseUploadSign(data, res);
-        if (url === '/submit-dispute')         return handleSubmitDispute(data, res);
-        if (url === '/submit-payment')         return handleSubmitPayment(data, res);
+        if (url === '/send-otp')             return handleSendOTP(data, res);
+        if (url === '/verify-otp')           return handleVerifyOTP(data, res);
+        if (url === '/register')             return handleRegister(data, res);
+        if (url === '/user/login')            return handleUserLogin(data, res);
+        if (url === '/enquiry')              return handleEnquiry(data, res);
+        if (url === '/upload-sign')           return handleSupabaseUploadSign(data, res);
+        if (url === '/submit-dispute')       return handleSubmitDispute(data, res);
 
-        if (url === '/owner/login')            return handleOwnerLogin(data, res);
+        // Owner auth (no token needed)
+        if (url === '/owner/login')          return handleOwnerLogin(data, res);
 
+        // Owner routes (token required)
         if (url.startsWith('/owner/')) {
           const ownerId = requireOwner(req, res);
           if (!ownerId) return;
@@ -1540,9 +1450,8 @@ const server = http.createServer((req, res) => {
           return json(res, 404, { error: 'Not found' });
         }
 
+        // Admin routes (token required)
         if (url.startsWith('/admin/') || url === '/submit-property') {
-          // FIX 8: /submit-property is public (property owner self-listing from main site)
-          // so it must NOT require admin auth. Admin routes still need JWT.
           if (url !== '/submit-property' && !requireAdmin(req, res)) return;
           if (url === '/submit-property')           return handleSaveProperty(data, res);
           if (url === '/admin/save-property')       return handleSaveProperty(data, res);
@@ -1572,5 +1481,121 @@ const server = http.createServer((req, res) => {
   json(res, 405, { error: 'Method not allowed' });
 });
 
+
+
+// ── Owner: Get full property detail ──────────────────────────────────────────
+async function handleOwnerPropertyDetail(ownerId, propId, res) {
+  try {
+    const r = await db.query(
+      `SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,
+       COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,
+       state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,
+       COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,
+       COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at
+       FROM properties WHERE id=$1 AND owner_id=$2`,
+      [propId, ownerId]
+    );
+    if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
+    const prop = r.rows[0];
+    try {
+      const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status FROM property_units WHERE property_id=$1 ORDER BY unit_label", [propId]);
+      prop.units = ur.rows;
+    } catch(e) { prop.units = []; }
+    json(res, 200, { success: true, property: prop });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// ── Cloudinary: Generate signed upload parameters ──────────────────────────
+// ── Supabase Storage upload — POST /upload-sign ─────────────────────────────
+// Strategy: server creates a signed upload URL for the browser to PUT directly
+// to Supabase Storage. File bytes never touch this server.
+// Supabase Storage bucket: "geoestate-docs" (create this in Supabase Dashboard)
+async function handleSupabaseUploadSign(data, res) {
+  const SUPABASE_URL         = process.env.SUPABASE_URL;
+  const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+  const BUCKET               = process.env.SUPABASE_BUCKET || 'geoestate-docs';
+
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return json(res, 503, { error: 'Storage not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in Railway environment variables.' });
+  }
+
+  const folder    = (data.folder || 'uploads').replace(/[^a-zA-Z0-9/_-]/g, '');
+  const ext       = data.ext || 'bin';
+  const filename  = folder + '/' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.' + ext;
+
+  try {
+    // Create a signed upload URL via Supabase Storage REST API
+    const signRes = await fetch(
+      `${SUPABASE_URL}/storage/v1/object/upload/sign/${BUCKET}/${filename}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ upsert: false })
+      }
+    );
+    if (!signRes.ok) {
+      const err = await signRes.text();
+      return json(res, 500, { error: 'Could not create signed URL: ' + err });
+    }
+    const signData = await signRes.json();
+    // signedURL is the path for the browser to PUT to
+    // Public URL is how we read the file back
+    const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${filename}`;
+    json(res, 200, {
+      signed_url:  SUPABASE_URL + '/storage/v1' + signData.url,
+      public_url:  publicUrl,
+      token:       signData.token,
+      path:        filename,
+      bucket:      BUCKET
+    });
+  } catch(e) {
+    json(res, 500, { error: e.message });
+  }
+}
+
+
+// ── Admin Login — POST /admin/login ──────────────────────────────────────────
+// Validates ADMIN_EMAIL + ADMIN_PASSWORD env vars, returns a signed JWT.
+// The raw password/secret NEVER leaves the server.
+async function handleAdminLogin(data, res) {
+  const { email, password } = data;
+  if (!email || !password) return json(res, 400, { error: 'Email and password required' });
+
+  // Constant-time comparison — pad buffers to same length to prevent
+  // timingSafeEqual throwing on length mismatch (which causes a 524 timeout)
+  function safeEqual(a, b) {
+    const ba = Buffer.from(a);
+    const bb = Buffer.from(b);
+    // Always compare max-length buffer to avoid short-circuit timing leak
+    const maxLen = Math.max(ba.length, bb.length);
+    const pa = Buffer.concat([ba, Buffer.alloc(maxLen - ba.length)]);
+    const pb = Buffer.concat([bb, Buffer.alloc(maxLen - bb.length)]);
+    return crypto.timingSafeEqual(pa, pb) && ba.length === bb.length;
+  }
+  const emailOk    = safeEqual(email.toLowerCase().trim(), ADMIN_EMAIL.toLowerCase().trim());
+  const passwordOk = safeEqual(password, ADMIN_PASSWORD);
+
+  if (!emailOk || !passwordOk) {
+    await new Promise(r => setTimeout(r, 500)); // slow down brute force
+    return json(res, 401, { error: 'Invalid email or password' });
+  }
+
+  const token = jwtSign({ role: 'admin', email: ADMIN_EMAIL }, JWT_SECRET, 8);
+  await logActivity('Admin login: ' + ADMIN_EMAIL).catch(() => {});
+  json(res, 200, { success: true, token, expiresIn: '8h' });
+}
+
+// ── Admin Logout — POST /admin/logout ────────────────────────────────────────
+// Stateless JWT — logout is handled client-side by deleting the token.
+// This endpoint exists for audit logging purposes.
+async function handleAdminLogout(req, res) {
+  await logActivity('Admin logout').catch(() => {});
+  json(res, 200, { success: true });
+}
+
+
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log('✅ GeoEstate API v2.1 running on port ' + PORT));
+server.listen(PORT, () => console.log('✅ GeoEstate API v2.0 running on port ' + PORT));
