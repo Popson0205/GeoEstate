@@ -477,7 +477,7 @@ async function handlePublicProperties(urlFull, res) {
     const state  = params.get('state');
     const search = params.get('q');
 
-    let query = "SELECT id, title, owner, owner_id, type, COALESCE(listing_type, type, 'rent') as listing_type, status, price, state, lga, address, img, created_at FROM properties WHERE status='live'";
+    let query = "SELECT id, title, owner, owner_id, type, COALESCE(listing_type, type, 'rent') as listing_type, status, price, state, lga, address, img, COALESCE(images, '[]'::jsonb) as images, COALESCE(lat, NULL) as lat, COALESCE(lng, NULL) as lng, COALESCE(geo, false) as geo, created_at FROM properties WHERE status='live'";
     const args = [];
 
     if (typeFilter) {
@@ -1074,16 +1074,16 @@ async function handleOwnerAddProperty(ownerId, data, res) {
     message: 'Please complete identity verification to list properties. You only need to do this once.'
   });
 
-  const { title, listing_type, price, monthly_rent, sale_price, lease_price, state, lga, address, img, images, bedrooms, bathrooms, size_sqm, description, amenities, notes } = data;
+  const { title, listing_type, price, monthly_rent, sale_price, lease_price, state, lga, address, img, images, bedrooms, bathrooms, size_sqm, description, amenities, notes, lat, lng, geo } = data;
   if (!title) return json(res, 400, { error: 'Property title required' });
   if (!listing_type || !['rent','buy','lease'].includes(listing_type)) return json(res, 400, { error: 'listing_type must be rent, buy, or lease' });
 
   const propId = 'PROP-' + Date.now();
   try {
     await db.query(
-      `INSERT INTO properties (id,title,owner_id,owner,listing_type,type,status,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,size_sqm,description,amenities,notes,submitted)
-       VALUES ($1,$2,$3,(SELECT fname||' '||lname FROM registrations WHERE id=$3),$4,$4,'pending',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
-      [propId, title, ownerId, listing_type, price||'', monthly_rent||null, sale_price||null, lease_price||null, state||'', lga||'', address||'', img||'', JSON.stringify(images||[]), bedrooms||null, bathrooms||null, size_sqm||null, description||'', JSON.stringify(amenities||[]), notes||'', new Date().toLocaleString('en-NG')]
+      `INSERT INTO properties (id,title,owner_id,owner,listing_type,type,status,price,monthly_rent,sale_price,lease_price,state,lga,address,img,images,bedrooms,bathrooms,size_sqm,description,amenities,notes,submitted,lat,lng,geo)
+       VALUES ($1,$2,$3,(SELECT fname||' '||lname FROM registrations WHERE id=$3),$4,$4,'pending',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+      [propId, title, ownerId, listing_type, price||'', monthly_rent||null, sale_price||null, lease_price||null, state||'', lga||'', address||'', img||'', JSON.stringify(images||[]), bedrooms||null, bathrooms||null, size_sqm||null, description||'', JSON.stringify(amenities||[]), notes||'', new Date().toLocaleString('en-NG'), (lat!=null ? lat : null), (lng!=null ? lng : null), !!geo]
     );
     await logActivity('Owner ' + ownerId + ' listed new property: ' + title);
     json(res, 200, { success: true, propertyId: propId, message: 'Property submitted for review. It will go live once approved.' });
@@ -1094,7 +1094,7 @@ async function handleOwnerUpdateProperty(ownerId, propId, data, res) {
   const own = await db.query('SELECT id FROM properties WHERE id=$1 AND owner_id=$2', [propId, ownerId]);
   if (!own.rows.length) return json(res, 403, { error: 'Property not found or not yours' });
   try {
-    const allowed = ['title','listing_type','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes'];
+    const allowed = ['title','listing_type','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lat','lng','geo'];
     const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
     if (!fields.length) return json(res, 400, { error: 'No valid fields' });
     const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');
