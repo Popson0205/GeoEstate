@@ -1309,7 +1309,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET') {
     if (url === '/')
-      return db.query('SELECT COUNT(*) FROM registrations').then(r => json(res,200,{status:'ok',service:'GeoEstate API',version:'2.1',db:'neon',registrations:r.rows[0].count})).catch(()=>json(res,200,{status:'ok',service:'GeoEstate API',version:'2.1'}));
+      return db.query('SELECT COUNT(*) FROM registrations').then(r => json(res,200,{status:'ok',service:'GeoEstate API',version:'2.1',db:'supabase',registrations:r.rows[0].count})).catch(()=>json(res,200,{status:'ok',service:'GeoEstate API',version:'2.1'}));
     if (url === '/health') return json(res, 200, { status: 'ok', service: 'GeoEstate API', version: '2.1' });
 
     if (url === '/properties')               return handlePublicProperties(urlFull, res);
