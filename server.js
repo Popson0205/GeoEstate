@@ -59,6 +59,18 @@ function jwtVerify(token, secret) {
   } catch(e) { return null; }
 }
 
+// ── Partner Config ───────────────────────────────────────────────────────────
+// Partners are trusted agencies/individuals who can list & manage properties
+// through their own Partner Portal (hamburger menu) without going through the
+// normal identity-verification flow. They authenticate with their name plus a
+// single shared PARTNER_ACCESS_TOKEN (set as an env var), not per-partner
+// credentials. Add more partners here as needed.
+const PARTNER_ACCESS_TOKEN = process.env.PARTNER_ACCESS_TOKEN;
+const PARTNERS = [
+  { id: 'partner-adebayo-taofeek', fname: 'Adebayo', lname: 'Taofeek', email: 'adebayo.taofeek@partners.geoestate.com.ng' },
+  { id: 'partner-olawale-ayuba',   fname: 'Olawale', lname: 'Ayuba',   email: 'olawale.ayuba@partners.geoestate.com.ng' }
+];
+
 // ── Sales Team Config ──────────────────────────────────────────────────────
 const SALES_TEAM = [
   {
@@ -971,6 +983,58 @@ async function handleSaveTransaction(data, res) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// PARTNER PORTAL
+// ══════════════════════════════════════════════════════════════
+// Partners re-use the exact same "registrations" row + owner token mechanism
+// as regular property owners (see handleOwnerLogin below) — the only
+// difference is *how* they authenticate. This means every existing /owner/*
+// endpoint (add-property, properties, profile, units, enquiries, etc.)
+// already works for partners with no further backend changes required.
+
+async function ensurePartnerAccounts() {
+  for (const p of PARTNERS) {
+    try {
+      await db.query(
+        `INSERT INTO registrations (id, fname, lname, email, role, type, status, is_verified, owner_since)
+         VALUES ($1,$2,$3,$4,'owner','owner','approved',TRUE,NOW())
+         ON CONFLICT (id) DO UPDATE SET role='owner', type='owner', status='approved', is_verified=TRUE`,
+        [p.id, p.fname, p.lname, p.email]
+      );
+    } catch (e) {
+      console.error('Failed to bootstrap partner account ' + p.id + ':', e.message);
+    }
+  }
+}
+
+async function handlePartnerLogin(data, res) {
+  const { name, token } = data;
+  if (!name || !token) return json(res, 400, { error: 'Partner name and access token are required.' });
+  if (!PARTNER_ACCESS_TOKEN) return json(res, 500, { error: 'Partner login is not configured. Set PARTNER_ACCESS_TOKEN on the server.' });
+  if (token.trim() !== PARTNER_ACCESS_TOKEN) return json(res, 401, { error: 'Invalid access token.' });
+
+  const norm = s => (s || '').trim().toLowerCase();
+  const partner = PARTNERS.find(p => norm(p.fname + ' ' + p.lname) === norm(name));
+  if (!partner) return json(res, 401, { error: 'Unrecognized partner name.' });
+
+  try {
+    await db.query(
+      `INSERT INTO registrations (id, fname, lname, email, role, type, status, is_verified, owner_since)
+       VALUES ($1,$2,$3,$4,'owner','owner','approved',TRUE,NOW())
+       ON CONFLICT (id) DO UPDATE SET role='owner', type='owner', status='approved', is_verified=TRUE`,
+      [partner.id, partner.fname, partner.lname, partner.email]
+    );
+    const authToken = 'owner:' + partner.id + ':' + Date.now();
+    await logActivity('Partner logged in: ' + partner.fname + ' ' + partner.lname);
+    json(res, 200, {
+      success: true,
+      token: authToken,
+      owner: { id: partner.id, fname: partner.fname, lname: partner.lname, email: partner.email, is_verified: true, role: 'owner' },
+      isPartner: true
+    });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
+// ══════════════════════════════════════════════════════════════
 // PHASE 2 — OWNER LAYER
 // ══════════════════════════════════════════════════════════════
 
@@ -1422,6 +1486,7 @@ const server = http.createServer((req, res) => {
         if (url === '/submit-payment')         return handleClientPaymentNotification(data, res); // alias for frontend
 
         if (url === '/owner/login')            return handleOwnerLogin(data, res);
+        if (url === '/partner/login')          return handlePartnerLogin(data, res);
 
         if (url.startsWith('/owner/')) {
           const ownerId = requireOwner(req, res);
@@ -1543,4 +1608,9 @@ async function handleAdminLogout(req, res) {
 }
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log('✅ GeoEstate API v2.1 running on port ' + PORT));
+server.listen(PORT, () => {
+  console.log('✅ GeoEstate API v2.1 running on port ' + PORT);
+  ensurePartnerAccounts()
+    .then(() => console.log('✅ Partner accounts ready (' + PARTNERS.length + ')'))
+    .catch(e => console.error('Partner account bootstrap failed:', e.message));
+});
