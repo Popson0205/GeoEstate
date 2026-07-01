@@ -67,8 +67,8 @@ function jwtVerify(token, secret) {
 // credentials. Add more partners here as needed.
 const PARTNER_ACCESS_TOKEN = process.env.PARTNER_ACCESS_TOKEN;
 const PARTNERS = [
-  { id: 'partner-adebayo-taofeek', fname: 'Adebayo', lname: 'Taofeek', email: 'adebayo.taofeek@partners.geoestate.com.ng' },
-  { id: 'partner-olawale-ayuba',   fname: 'Olawale', lname: 'Ayuba',   email: 'olawale.ayuba@partners.geoestate.com.ng' }
+  { id: 'partner-adebayo-taofeek', fname: 'Adebayo', lname: 'Taofeek', email: 'Tfk00001@gmail.com', phone: '+2347030567544' },
+  { id: 'partner-olawale-ayuba',   fname: 'Olawale', lname: 'Ayuba',   email: 'ayuba.olawaledavid@yahoo.com', phone: '+2348135575379' }
 ];
 
 // ── Sales Team Config ──────────────────────────────────────────────────────
@@ -264,6 +264,49 @@ function enquiryEmail(enq, property) {
     <tr><td style="padding:6px 12px;color:#6b7280">Phone</td><td style="padding:6px 12px">${enq.phone || '—'}</td></tr>
     <tr><td style="padding:6px 12px;color:#6b7280">Message</td><td style="padding:6px 12px">${enq.message || '—'}</td></tr>
   </table>
+</td></tr>
+</table></td></tr></table></body></html>`;
+}
+
+// Partner enquiry alert — goes ONLY to the partner who listed the property,
+// and ONLY for partner-listed properties. Gives the partner quick-action
+// links (WhatsApp / Call / Email) so they can respond to the enquirer directly.
+function partnerAlertEmail(enq, propertyTitle, partner) {
+  const waMsg = encodeURIComponent(
+    'Hi ' + enq.name + ', I\'m ' + partner.fname + ' from GeoEstate. I saw your enquiry about "' + propertyTitle + '". I\'d love to help you with this. When is a good time to talk?'
+  );
+  const waLink = 'https://wa.me/' + (enq.phone||'').replace(/[^0-9]/g,'') + '?text=' + waMsg;
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 20px"><tr><td align="center">
+<table width="100%" style="max-width:540px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08)">
+<tr><td style="background:linear-gradient(135deg,#0d3d22,#1a6b3c);padding:24px 32px">
+  <div style="color:#fff;font-size:20px;font-weight:800">📬 New Enquiry On Your Listing</div>
+  <div style="color:rgba(255,255,255,.7);font-size:13px;margin-top:4px">Action required — respond within 1 hour</div>
+</td></tr>
+<tr><td style="padding:28px 32px">
+  <div style="background:#f0fdf4;border-radius:10px;padding:16px;margin-bottom:20px">
+    <div style="font-size:12px;color:#6b7280;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Property</div>
+    <div style="font-size:16px;font-weight:800;color:#0d3d22">${propertyTitle}</div>
+  </div>
+  <div style="background:#f9fafb;border-radius:10px;padding:16px;margin-bottom:20px">
+    <div style="font-size:12px;color:#6b7280;font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px">Enquirer Details</div>
+    <table style="width:100%;font-size:14px;border-collapse:collapse">
+      <tr><td style="padding:5px 0;color:#6b7280;width:80px">Name</td><td style="padding:5px 0;font-weight:700">${enq.name}</td></tr>
+      <tr><td style="padding:5px 0;color:#6b7280">Email</td><td style="padding:5px 0">${enq.email}</td></tr>
+      <tr><td style="padding:5px 0;color:#6b7280">Phone</td><td style="padding:5px 0;font-weight:700">${enq.phone || '—'}</td></tr>
+      <tr><td style="padding:5px 0;color:#6b7280">Message</td><td style="padding:5px 0;font-style:italic">${enq.message || '—'}</td></tr>
+    </table>
+  </div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
+    <a href="${waLink}" style="display:inline-block;background:#25D366;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:700;font-size:14px">💬 WhatsApp</a>
+    <a href="tel:${enq.phone||''}" style="display:inline-block;background:#1a6b3c;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:700;font-size:14px">📞 Call</a>
+    <a href="mailto:${enq.email}" style="display:inline-block;background:#f3f4f6;color:#111;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:700;font-size:14px">✉️ Email</a>
+  </div>
+  <div style="font-size:12px;color:#9ca3af;border-top:1px solid #f3f4f6;padding-top:16px">
+    This alert was sent to you as ${partner.fname} ${partner.lname} because this enquiry is on a property you listed as a GeoEstate Partner.<br>
+    Log into the <a href="https://www.geoestate.com.ng/partner" style="color:#1a6b3c">GeoEstate Partner Portal</a> to view and respond to this enquiry.
+  </div>
 </td></tr>
 </table></td></tr></table></body></html>`;
 }
@@ -995,10 +1038,10 @@ async function ensurePartnerAccounts() {
   for (const p of PARTNERS) {
     try {
       await db.query(
-        `INSERT INTO registrations (id, fname, lname, email, role, type, status, is_verified, owner_since)
-         VALUES ($1,$2,$3,$4,'owner','owner','approved',TRUE,NOW())
-         ON CONFLICT (id) DO UPDATE SET role='owner', type='owner', status='approved', is_verified=TRUE`,
-        [p.id, p.fname, p.lname, p.email]
+        `INSERT INTO registrations (id, fname, lname, email, phone, role, type, status, is_verified, owner_since)
+         VALUES ($1,$2,$3,$4,$5,'owner','owner','approved',TRUE,NOW())
+         ON CONFLICT (id) DO UPDATE SET email=$4, phone=$5, role='owner', type='owner', status='approved', is_verified=TRUE`,
+        [p.id, p.fname, p.lname, p.email, p.phone || '']
       );
     } catch (e) {
       console.error('Failed to bootstrap partner account ' + p.id + ':', e.message);
@@ -1018,10 +1061,10 @@ async function handlePartnerLogin(data, res) {
 
   try {
     await db.query(
-      `INSERT INTO registrations (id, fname, lname, email, role, type, status, is_verified, owner_since)
-       VALUES ($1,$2,$3,$4,'owner','owner','approved',TRUE,NOW())
-       ON CONFLICT (id) DO UPDATE SET role='owner', type='owner', status='approved', is_verified=TRUE`,
-      [partner.id, partner.fname, partner.lname, partner.email]
+      `INSERT INTO registrations (id, fname, lname, email, phone, role, type, status, is_verified, owner_since)
+       VALUES ($1,$2,$3,$4,$5,'owner','owner','approved',TRUE,NOW())
+       ON CONFLICT (id) DO UPDATE SET email=$4, phone=$5, role='owner', type='owner', status='approved', is_verified=TRUE`,
+      [partner.id, partner.fname, partner.lname, partner.email, partner.phone || '']
     );
     const authToken = 'owner:' + partner.id + ':' + Date.now();
     await logActivity('Partner logged in: ' + partner.fname + ' ' + partner.lname);
@@ -1194,6 +1237,28 @@ async function handleOwnerEnquiries(ownerId, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// Owner/Partner-scoped enquiry update — lets an owner (or a partner, who is
+// just an owner-type account) respond to / manage ONLY enquiries on
+// properties they themselves listed. Ownership is verified via the join
+// below, so nobody can touch an enquiry on a property they don't own.
+async function handleOwnerUpdateEnquiry(ownerId, enquiryId, data, res) {
+  const { status, notes } = data;
+  try {
+    const own = await db.query(
+      `SELECT e.id FROM enquiries e JOIN properties p ON p.id=e.property_id WHERE e.id=$1 AND p.owner_id=$2`,
+      [enquiryId, ownerId]
+    );
+    if (!own.rows.length) return json(res, 403, { error: 'Enquiry not found or not yours to manage' });
+    await db.query(
+      'UPDATE enquiries SET status=COALESCE($1,status), notes=COALESCE($2,notes), assigned_to=$3 WHERE id=$4',
+      [status || null, notes || null, ownerId, enquiryId]
+    );
+    await logActivity('Enquiry ' + enquiryId + ' responded to by owner/partner ' + ownerId);
+    broadcast('enquiry_updated', { id: enquiryId, status });
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 // ══════════════════════════════════════════════════════════════
 // PHASE 3 — UNIT / ROOM MANAGEMENT
 // ══════════════════════════════════════════════════════════════
@@ -1318,11 +1383,15 @@ async function handleEnquiry(data, res) {
 
     const propR = await db.query('SELECT title, owner_id, (SELECT email FROM registrations WHERE id=properties.owner_id) as owner_email FROM properties WHERE id=$1', [property_id]);
     const propTitle = propR.rows[0]?.title || resolvedTitle || 'Property';
-    const isPartnerListing = PARTNERS.some(p => p.id === propR.rows[0]?.owner_id);
+    const listingPartner = PARTNERS.find(p => p.id === propR.rows[0]?.owner_id);
+    const isPartnerListing = !!listingPartner;
 
-    // FIX 1: Owner gets notified about the enquiry — EXCEPT for partner-listed
-    // properties, where only the sales team should be contacted directly.
-    if (propR.rows[0]?.owner_email && !isPartnerListing) {
+    // Conditional routing: a partner only ever gets emailed about enquiries on
+    // properties THEY listed. Regular owners keep getting the normal owner email.
+    if (isPartnerListing) {
+      sendEmail(listingPartner.email, '📬 New Enquiry On Your Listing: ' + propTitle, partnerAlertEmail({name,email,phone,message}, propTitle, listingPartner))
+        .catch(e => console.warn('Enquiry email to partner failed:', e.message));
+    } else if (propR.rows[0]?.owner_email) {
       sendEmail(propR.rows[0].owner_email, '📬 New Enquiry: ' + propTitle, enquiryEmail({name,email,phone,message}, propTitle))
         .catch(e => console.warn('Enquiry email to owner failed:', e.message));
     }
@@ -1501,6 +1570,8 @@ const server = http.createServer((req, res) => {
           if (owUnitMatch) return handleAddUnit(ownerId, owUnitMatch[1], data, res);
           const owUnitPatch = url.match(/^\/owner\/property\/([^/]+)\/units\/(\d+)$/);
           if (owUnitPatch) return handleUpdateUnit(ownerId, owUnitPatch[1], owUnitPatch[2], data, res);
+          const owEnqMatch = url.match(/^\/owner\/enquiry\/([^/]+)$/);
+          if (owEnqMatch) return handleOwnerUpdateEnquiry(ownerId, owEnqMatch[1], data, res);
           return json(res, 404, { error: 'Not found' });
         }
 
