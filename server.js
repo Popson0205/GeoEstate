@@ -216,7 +216,7 @@ function otpEmail(code, name, purpose) {
   <div style="background:#fffbeb;border-radius:8px;padding:14px 16px;font-size:13px;color:#92400e">🔒 GeoEstate will never ask for this code by phone or message.</div>
 </td></tr>
 <tr><td style="background:#f9fafb;padding:20px 40px;border-top:1px solid #f3f4f6;text-align:center">
-  <div style="font-size:12px;color:#9ca3af">GeoEstate · Popson Geospatial Services · Nigeria<br>
+  <div style="font-size:12px;color:#9ca3af">GeoEstate · GeoEstate NIG Limited · Nigeria<br>
   <a href="mailto:admin@geoestate.com.ng" style="color:#1a6b3c">admin@geoestate.com.ng</a></div>
 </td></tr>
 </table></td></tr></table></body></html>`;
@@ -335,7 +335,7 @@ function enquirerConfirmEmail(enq, propertyTitle) {
   <p style="color:#6b7280;font-size:13px">For urgent queries, contact us at <a href="mailto:admin@geoestate.com.ng" style="color:#1a6b3c">admin@geoestate.com.ng</a></p>
 </td></tr>
 <tr><td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #f3f4f6;text-align:center">
-  <div style="font-size:12px;color:#9ca3af">GeoEstate · Popson Geospatial Services · Nigeria</div>
+  <div style="font-size:12px;color:#9ca3af">GeoEstate · GeoEstate NIG Limited · Nigeria</div>
 </td></tr>
 </table></td></tr></table></body></html>`;
 }
