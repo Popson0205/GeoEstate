@@ -1318,9 +1318,11 @@ async function handleEnquiry(data, res) {
 
     const propR = await db.query('SELECT title, owner_id, (SELECT email FROM registrations WHERE id=properties.owner_id) as owner_email FROM properties WHERE id=$1', [property_id]);
     const propTitle = propR.rows[0]?.title || resolvedTitle || 'Property';
+    const isPartnerListing = PARTNERS.some(p => p.id === propR.rows[0]?.owner_id);
 
-    // FIX 1: Owner gets notified about the enquiry
-    if (propR.rows[0]?.owner_email) {
+    // FIX 1: Owner gets notified about the enquiry — EXCEPT for partner-listed
+    // properties, where only the sales team should be contacted directly.
+    if (propR.rows[0]?.owner_email && !isPartnerListing) {
       sendEmail(propR.rows[0].owner_email, '📬 New Enquiry: ' + propTitle, enquiryEmail({name,email,phone,message}, propTitle))
         .catch(e => console.warn('Enquiry email to owner failed:', e.message));
     }
