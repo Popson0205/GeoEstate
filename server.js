@@ -1,4 +1,20 @@
 // GeoEstate API Server — Production-ready build
+// ═══════════════════════════════════════════════════════════════
+// GeoEstate API — Hosted on Railway
+// DB: Supabase (PostgreSQL)  |  Storage: Supabase Storage
+// Domain DNS: Cloudflare  |  Node version: Railway default
+//
+// Required Railway Environment Variables:
+//   SUPABASE_DB_URL        — Supabase PostgreSQL connection string
+//   SUPABASE_URL           — https://xxxx.supabase.co
+//   SUPABASE_SERVICE_KEY   — Supabase service_role key (for signed uploads)
+//   SUPABASE_BUCKET        — Storage bucket name (default: geoestate-docs)
+//   SECRET_RESEND_API_KEY  — Resend.com API key (email OTPs)
+//   ADMIN_EMAIL            — Admin login email
+//   ADMIN_PASSWORD         — Admin login password
+//   JWT_SECRET             — Random strong secret for JWT signing
+//   PORT                   — Set automatically by Railway (do not hardcode)
+// ═══════════════════════════════════════════════════════════════
 // Loads credentials from .env file
 const fs   = require('fs');
 const path = require('path');
