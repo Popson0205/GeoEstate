@@ -4,7 +4,7 @@
 // Required Railway Env Vars:
 //   SUPABASE_DB_URL, SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_BUCKET
 //   SECRET_RESEND_API_KEY, ADMIN_EMAIL, ADMIN_PASSWORD, JWT_SECRET
-//   PORT — set automatically by Railway, do NOT hardcode
+//   PORT — auto-set by Railway, do NOT hardcode
 // ═══════════════════════════════════════════════════════════════════════
 // Loads credentials from .env file
 const fs   = require('fs');
