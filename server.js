@@ -1638,6 +1638,7 @@ const server = http.createServer((req, res) => {
         // Public endpoints
         if (url === '/admin/login')            return handleAdminLogin(data, res);
         if (url === '/admin/logout')           return handleAdminLogout(req, res);
+        if (url === '/admin/refresh')          return handleAdminRefresh(req, res);
         if (url === '/send-otp')             return handleSendOTP(data, res);
         if (url === '/verify-otp')           return handleVerifyOTP(data, res);
         if (url === '/register')             return handleRegister(data, res);
@@ -1800,6 +1801,20 @@ async function handleAdminLogin(data, res) {
 
   const token = jwtSign({ role: 'admin', email: ADMIN_EMAIL }, JWT_SECRET, 8);
   await logActivity('Admin login: ' + ADMIN_EMAIL).catch(() => {});
+  json(res, 200, { success: true, token, expiresIn: '8h' });
+}
+
+// ── Admin Refresh — POST /admin/refresh ──────────────────────────────────────
+// Lets the client silently renew its token before the 8h window runs out, so
+// an admin actively using the panel never gets a surprise hard-logout mid-
+// session. Requires the CURRENT token to still be valid — this extends an
+// active session, it can't resurrect one that's already expired or was
+// signed with an old JWT_SECRET (e.g. after a secret rotation), which is
+// intentional: that case should always require a real re-login.
+async function handleAdminRefresh(req, res) {
+  const payload = requireAdmin(req, res);
+  if (!payload) return; // requireAdmin already sent the 401
+  const token = jwtSign({ role: 'admin', email: payload.email || ADMIN_EMAIL }, JWT_SECRET, 8);
   json(res, 200, { success: true, token, expiresIn: '8h' });
 }
 
