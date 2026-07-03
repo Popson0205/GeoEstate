@@ -570,7 +570,7 @@ async function handleGetRegistrations(url, res) {
       employer: r.employer||'—', state: r.state||'—', lga: r.lga||'—',
       address: r.address||'—', nin: r.nin||'***-***-****',
       doc: r.doc||'Pending upload', notes: r.notes||'',
-      photo_url: r.photo_url||'', id_doc_url: r.id_doc_url||'',
+      photo_url: r.photo_url||'', id_doc_url: r.id_doc_url||'', other_doc_url: r.other_doc_url||'',
       nextOfKin: r.next_of_kin||'—', nextOfKinRel: r.next_of_kin_rel||'—',
       nextOfKinPhone: r.next_of_kin_phone||'—',
       isVerified: r.is_verified||false
@@ -1040,7 +1040,7 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
     const r = await db.query('SELECT is_verified FROM registrations WHERE id=$1', [ownerId]);
     if (r.rows[0]?.is_verified) return json(res, 200, { success: true, alreadyVerified: true, message: 'Already verified — no action needed.' });
 
-    const { nin, doc_type, doc_url, selfie_url, dob, gender, occupation, employer, state, lga, address, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
+    const { nin, doc_type, doc_url, selfie_url, other_doc_url, dob, gender, occupation, employer, state, lga, address, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
     // Try full update with all fields, fall back to minimal if columns missing
     try {
       await db.query(
@@ -1057,19 +1057,21 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
           next_of_kin_rel=COALESCE(NULLIF($13,''),next_of_kin_rel),
           next_of_kin_phone=COALESCE(NULLIF($14,''),next_of_kin_phone),
           photo_url=COALESCE(NULLIF($15,''),photo_url),
+          id_doc_url=COALESCE(NULLIF($16,''),id_doc_url),
+          other_doc_url=COALESCE(NULLIF($17,''),other_doc_url),
           updated_at=NOW()
         WHERE id=$4`,
         [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId,
          dob||'', gender||'', occupation||'', employer||'',
          state||'', lga||'', address||'',
          next_of_kin||'', next_of_kin_rel||'', next_of_kin_phone||'',
-         selfie_url||'']
+         selfie_url||'', doc_url||'', other_doc_url||'']
       );
     } catch(e) {
       // Fallback: minimal update if extended columns don't exist
       await db.query(
-        'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, photo_url=COALESCE(NULLIF($5,\'\'),photo_url), updated_at=NOW() WHERE id=$4',
-        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId, selfie_url||'']
+        'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, photo_url=COALESCE(NULLIF($5,\'\'),photo_url), id_doc_url=COALESCE(NULLIF($6,\'\'),id_doc_url), updated_at=NOW() WHERE id=$4',
+        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId, selfie_url||'', doc_url||'']
       );
     }
     await logActivity('Owner identity submitted for review: ' + ownerId);
