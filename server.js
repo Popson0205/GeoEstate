@@ -41,6 +41,20 @@ if (!ADMIN_EMAIL || !ADMIN_PASSWORD || !JWT_SECRET) {
   process.exit(1);
 }
 
+// ── Partner Portal directory ─────────────────────────────────────────────────
+// Set PARTNERS_JSON in the environment, e.g.:
+//   [{"name":"Adebayo Taofeek","token":"..."},{"name":"Olawale Ayuba","token":"..."}]
+// Each partner gets a stable pseudo-owner-id (PARTNER-<slug>) so their listings
+// stay isolated from real property owners and from each other, reusing the
+// existing owner:<id>:<timestamp> token scheme and /owner/* endpoints.
+let PARTNERS = [];
+try { PARTNERS = JSON.parse(process.env.PARTNERS_JSON || '[]'); } catch(e) {
+  console.warn('PARTNERS_JSON is not valid JSON — partner login will reject everyone until fixed.');
+}
+function partnerSlug(name) {
+  return 'PARTNER-' + String(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
 // ── Minimal HS256 JWT (no external deps) ─────────────────────────────────────
 const crypto = require('crypto');
 function b64url(buf) { return buf.toString('base64').replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_'); }
@@ -973,6 +987,44 @@ async function handleOwnerLogin(data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// ── Partner Login — POST /partner/login ──────────────────────────────────────
+// Checks {name, token} against the PARTNERS_JSON directory. On success, issues
+// the same owner:<id>:<timestamp> token format the /owner/* endpoints already
+// understand, but with a stable per-partner pseudo-id (PARTNER-<slug>) instead
+// of a real registrations.id — so a partner's properties (owner_id = that
+// pseudo-id) can never collide with, or be confused for, a real owner's.
+async function handlePartnerLogin(data, res) {
+  const { name, token } = data;
+  if (!name || !token) return json(res, 400, { error: 'Name and access token are required.' });
+  const partner = PARTNERS.find(p => p.name === name);
+  if (!partner || partner.token !== token) {
+    return json(res, 401, { error: 'Invalid name or access token.' });
+  }
+  const partnerId = partnerSlug(name);
+  const [fname, ...rest] = name.trim().split(/\s+/);
+  const lname = rest.join(' ') || fname;
+
+  // Make sure a lightweight, pre-approved registrations row exists for this
+  // partner — /owner/* endpoints (verification guard, profile, etc.) look
+  // the id up there. Pre-verified since partners are vetted out-of-band.
+  try {
+    await db.query(
+      `INSERT INTO registrations (id, fname, lname, email, role, type, status, is_verified, initials)
+       VALUES ($1,$2,$3,$4,'owner','partner','approved',true,$5)
+       ON CONFLICT (id) DO NOTHING`,
+      [partnerId, fname, lname, partnerId.toLowerCase() + '@partners.geoestate.local',
+       (fname[0] || 'P').toUpperCase() + (lname[0] || '').toUpperCase()]
+    );
+  } catch(e) { console.warn('Partner registrations row ensure failed:', e.message); }
+
+  const ownerToken = 'owner:' + partnerId + ':' + Date.now();
+  json(res, 200, {
+    success: true,
+    token: ownerToken,
+    owner: { id: partnerId, fname, lname, role: 'partner' }
+  });
+}
+
 async function handleOwnerProfile(ownerId, res) {
   try {
     const r = await db.query('SELECT id,fname,lname,email,phone,is_verified,owner_since,status,role FROM registrations WHERE id=$1', [ownerId]);
@@ -1596,6 +1648,7 @@ const server = http.createServer((req, res) => {
 
         // Owner auth (no token needed)
         if (url === '/owner/login')          return handleOwnerLogin(data, res);
+        if (url === '/partner/login')        return handlePartnerLogin(data, res);
 
         // Owner routes (token required)
         if (url.startsWith('/owner/')) {
