@@ -389,7 +389,7 @@ async function handleUserLogin(data, res) {
   if (!email || !password) return json(res, 400, { error: 'Email and password required' });
   try {
     const r = await db.query(
-      'SELECT id, fname, lname, email, phone, role, status, is_verified, pass_hash FROM registrations WHERE email = $1',
+      'SELECT id, fname, lname, email, phone, role, status, is_verified, pass_hash, photo_url FROM registrations WHERE email = $1',
       [email.toLowerCase().trim()]
     );
     if (!r.rows.length) return json(res, 401, { error: 'No account found with this email. Please register first.' });
@@ -416,7 +416,8 @@ async function handleUserLogin(data, res) {
         email:    user.email,
         phone:    user.phone,
         role:     user.role,
-        verified: user.is_verified || false
+        verified: user.is_verified || false,
+        photo_url: user.photo_url || ''
       }
     });
   } catch(e) {
@@ -555,6 +556,7 @@ async function handleGetRegistrations(url, res) {
       employer: r.employer||'—', state: r.state||'—', lga: r.lga||'—',
       address: r.address||'—', nin: r.nin||'***-***-****',
       doc: r.doc||'Pending upload', notes: r.notes||'',
+      photo_url: r.photo_url||'', id_doc_url: r.id_doc_url||'',
       nextOfKin: r.next_of_kin||'—', nextOfKinRel: r.next_of_kin_rel||'—',
       nextOfKinPhone: r.next_of_kin_phone||'—',
       isVerified: r.is_verified||false
@@ -1002,18 +1004,20 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
           next_of_kin=COALESCE(NULLIF($12,''),next_of_kin),
           next_of_kin_rel=COALESCE(NULLIF($13,''),next_of_kin_rel),
           next_of_kin_phone=COALESCE(NULLIF($14,''),next_of_kin_phone),
+          photo_url=COALESCE(NULLIF($15,''),photo_url),
           updated_at=NOW()
         WHERE id=$4`,
         [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId,
          dob||'', gender||'', occupation||'', employer||'',
          state||'', lga||'', address||'',
-         next_of_kin||'', next_of_kin_rel||'', next_of_kin_phone||'']
+         next_of_kin||'', next_of_kin_rel||'', next_of_kin_phone||'',
+         selfie_url||'']
       );
     } catch(e) {
       // Fallback: minimal update if extended columns don't exist
       await db.query(
-        'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, updated_at=NOW() WHERE id=$4',
-        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId]
+        'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, photo_url=COALESCE(NULLIF($5,\'\'),photo_url), updated_at=NOW() WHERE id=$4',
+        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId, selfie_url||'']
       );
     }
     await logActivity('Owner identity submitted for review: ' + ownerId);
