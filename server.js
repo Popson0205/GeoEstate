@@ -1294,8 +1294,8 @@ async function handleOwnerAddProperty(ownerId, data, res) {
          $50, $51, $52, $53, $54,
          $55, $56, $57,
          $58, $59, $60, $61, $62,
-         $63, $64, CASE WHEN $63 IS NOT NULL AND $64 IS NOT NULL THEN TRUE ELSE FALSE END,
-         $65
+         $63, $64, CASE WHEN $62 IS NOT NULL AND $63 IS NOT NULL THEN TRUE ELSE FALSE END,
+         $64
        )`,
       [
         propId, title, ownerId, listing_type, displayPrice,
