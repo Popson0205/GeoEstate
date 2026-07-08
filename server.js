@@ -1305,8 +1305,8 @@ async function handleOwnerAddProperty(ownerId, data, res) {
          $49, $50, $51, $52, $53,
          $54, $55, $56,
          $57, $58, $59, $60, $61,
-         $62, $63, CASE WHEN $62::text IS NOT NULL AND $63::text IS NOT NULL THEN TRUE ELSE FALSE END,
-         $64, $65, $66
+         $62, $63, $64,
+         $65, $66, $67
        )`,
       [
         propId, title, ownerId, listing_type, displayPrice,
@@ -1325,6 +1325,7 @@ async function handleOwnerAddProperty(ownerId, data, res) {
         lease_type, lease_payment_freq, lease_duration_years,
         lease_start_date||null, renewal_option, escalation_pct, permitted_use, prop_condition,
         lat||null, lng||null,
+        !!(lat||null) && !!(lng||null),
         JSON.stringify(metadata),
         video_url || null,
         JSON.stringify(docList)
