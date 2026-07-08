@@ -27,8 +27,35 @@ process.on('unhandledRejection', (reason) => {
 process.env.NODE_NO_WARNINGS = "1";
 const db = new Pool({
   connectionString: process.env.SUPABASE_DB_URL, // Supabase: Settings → Database → URI (Transaction pooler, port 6543)
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 10,                        // cap concurrent connections against the pooler
+  connectionTimeoutMillis: 8000,  // fail fast if no connection is free within 8s
+  idleTimeoutMillis: 30000,       // recycle idle clients instead of holding slots forever
+  statement_timeout: 15000,       // kill any single query that runs longer than 15s
+  query_timeout: 15000            // belt-and-braces client-side mirror of the above
 });
+
+// Log pool-level errors instead of letting them disappear silently — a bad
+// idle client can otherwise sit there forever and quietly eat a connection.
+db.on('error', (err) => {
+  console.error('Unexpected error on idle DB client:', err.message);
+});
+
+// ── Query-with-timeout helper ────────────────────────────────────────────
+// Defense in depth: even with statement_timeout set above, wrap any query we
+// consider "critical path for a user-facing request" so a stuck connection
+// acquisition (not just a stuck query) can't hang a request for 100+ seconds
+// and get silently killed by the platform's gateway timeout looking like a
+// CORS failure to the browser. Callers get a real, fast error instead.
+function queryWithTimeout(sql, params, ms) {
+  ms = ms || 15000;
+  return Promise.race([
+    db.query(sql, params),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Database query timed out after ' + ms + 'ms — please try again')), ms)
+    )
+  ]);
+}
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.SECRET_RESEND_API_KEY;
@@ -1135,11 +1162,12 @@ async function handleOwnerAddProperty(ownerId, data, res) {
   // ── Verification guard ──────────────────────────────────────
   let vrRow;
   try {
-    const vr = await db.query('SELECT is_verified, status FROM registrations WHERE id=$1', [ownerId]);
+    const vr = await queryWithTimeout('SELECT is_verified, status FROM registrations WHERE id=$1', [ownerId]);
     if (!vr.rows.length) return json(res, 404, { error: 'Owner not found' });
     vrRow = vr.rows[0];
   } catch(e) {
-    const vr2 = await db.query('SELECT status FROM registrations WHERE id=$1', [ownerId]);
+    if (/timed out/.test(e.message)) return json(res, 504, { error: e.message });
+    const vr2 = await queryWithTimeout('SELECT status FROM registrations WHERE id=$1', [ownerId]);
     if (!vr2.rows.length) return json(res, 404, { error: 'Owner not found' });
     vrRow = { is_verified: vr2.rows[0].status === 'approved', status: vr2.rows[0].status };
   }
@@ -1262,7 +1290,7 @@ async function handleOwnerAddProperty(ownerId, data, res) {
     : '');
 
   try {
-    await db.query(
+    await queryWithTimeout(
       `INSERT INTO properties (
          id, title, owner_id, owner, listing_type, type, status, price,
          property_type, state, lga, address, landmark,
