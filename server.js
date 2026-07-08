@@ -1198,7 +1198,6 @@ async function handleOwnerAddProperty(ownerId, data, res) {
     rent_category  = data.rent_category || 'standard';
     caution_fee    = data.caution_fee    || null;
     rent_includes  = Array.isArray(data.rent_includes) ? data.rent_includes : [];
-    furnishing     = data.furnishing     || null;
     agreement_doc  = data.agreement_doc  || null;
 
     if (rent_category === 'shortlet') {
