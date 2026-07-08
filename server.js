@@ -27,35 +27,8 @@ process.on('unhandledRejection', (reason) => {
 process.env.NODE_NO_WARNINGS = "1";
 const db = new Pool({
   connectionString: process.env.SUPABASE_DB_URL, // Supabase: Settings → Database → URI (Transaction pooler, port 6543)
-  ssl: { rejectUnauthorized: false },
-  max: 10,                        // cap concurrent connections against the pooler
-  connectionTimeoutMillis: 8000,  // fail fast if no connection is free within 8s
-  idleTimeoutMillis: 30000,       // recycle idle clients instead of holding slots forever
-  statement_timeout: 15000,       // kill any single query that runs longer than 15s
-  query_timeout: 15000            // belt-and-braces client-side mirror of the above
+  ssl: { rejectUnauthorized: false }
 });
-
-// Log pool-level errors instead of letting them disappear silently — a bad
-// idle client can otherwise sit there forever and quietly eat a connection.
-db.on('error', (err) => {
-  console.error('Unexpected error on idle DB client:', err.message);
-});
-
-// ── Query-with-timeout helper ────────────────────────────────────────────
-// Defense in depth: even with statement_timeout set above, wrap any query we
-// consider "critical path for a user-facing request" so a stuck connection
-// acquisition (not just a stuck query) can't hang a request for 100+ seconds
-// and get silently killed by the platform's gateway timeout looking like a
-// CORS failure to the browser. Callers get a real, fast error instead.
-function queryWithTimeout(sql, params, ms) {
-  ms = ms || 15000;
-  return Promise.race([
-    db.query(sql, params),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Database query timed out after ' + ms + 'ms — please try again')), ms)
-    )
-  ]);
-}
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.SECRET_RESEND_API_KEY;
@@ -618,6 +591,11 @@ async function handleGetProperties(res) {
         COALESCE(lease_price, NULL) as lease_price,
         state, lga, address, img,
         COALESCE(images, '[]'::jsonb) as images,
+        video_url,
+        COALESCE(docs, '[]'::jsonb) as docs,
+        COALESCE(metadata, '{}'::jsonb) as metadata,
+        doc_coo, doc_deed, doc_survey, doc_approval, sale_agreement,
+        agreement_doc,
         COALESCE(bedrooms, NULL) as bedrooms,
         COALESCE(bathrooms, NULL) as bathrooms,
         COALESCE(size_sqm, NULL) as size_sqm,
@@ -1162,12 +1140,11 @@ async function handleOwnerAddProperty(ownerId, data, res) {
   // ── Verification guard ──────────────────────────────────────
   let vrRow;
   try {
-    const vr = await queryWithTimeout('SELECT is_verified, status FROM registrations WHERE id=$1', [ownerId]);
+    const vr = await db.query('SELECT is_verified, status FROM registrations WHERE id=$1', [ownerId]);
     if (!vr.rows.length) return json(res, 404, { error: 'Owner not found' });
     vrRow = vr.rows[0];
   } catch(e) {
-    if (/timed out/.test(e.message)) return json(res, 504, { error: e.message });
-    const vr2 = await queryWithTimeout('SELECT status FROM registrations WHERE id=$1', [ownerId]);
+    const vr2 = await db.query('SELECT status FROM registrations WHERE id=$1', [ownerId]);
     if (!vr2.rows.length) return json(res, 404, { error: 'Owner not found' });
     vrRow = { is_verified: vr2.rows[0].status === 'approved', status: vr2.rows[0].status };
   }
@@ -1188,10 +1165,17 @@ async function handleOwnerAddProperty(ownerId, data, res) {
   const propId = 'PROP-' + Date.now();
   const {
     price, state, lga, address, landmark,
-    img, images, bedrooms, bathrooms, toilets,
+    img, images, video_url, docs, bedrooms, bathrooms, toilets,
     size_sqm, year_built, description, amenities,
     furnishing, notes, property_type, lat, lng
   } = data;
+
+  // ── Media validation: require a minimum number of photos ────
+  const imageList = Array.isArray(images) ? images.filter(Boolean) : [];
+  if (imageList.length < 3) {
+    return json(res, 400, { error: 'Please upload at least 3 photos of the property.' });
+  }
+  const docList = Array.isArray(docs) ? docs.filter(Boolean) : [];
 
   // ── Type-specific fields ────────────────────────────────────
   let monthly_rent = null, annual_rent = null, sale_price = null, lease_price = null;
@@ -1290,7 +1274,7 @@ async function handleOwnerAddProperty(ownerId, data, res) {
     : '');
 
   try {
-    await queryWithTimeout(
+    await db.query(
       `INSERT INTO properties (
          id, title, owner_id, owner, listing_type, type, status, price,
          property_type, state, lga, address, landmark,
@@ -1305,7 +1289,7 @@ async function handleOwnerAddProperty(ownerId, data, res) {
          doc_coo, doc_deed, doc_survey, doc_approval, sale_agreement,
          lease_type, lease_payment_freq, lease_duration_years,
          lease_start_date, renewal_option, escalation_pct, permitted_use, condition,
-         lat, lng, geo, metadata
+         lat, lng, geo, metadata, video_url, docs
        )
        VALUES (
          $1, $2, $3, (SELECT fname||' '||lname FROM registrations WHERE id=$3), $4, $4,
@@ -1316,19 +1300,19 @@ async function handleOwnerAddProperty(ownerId, data, res) {
          $26, $27, $28, $29, $30,
          $31, $32, $33, $34, $35,
          $36, $37, $38,
-         $39, $40, $41, $42, $43,
-         $44, $45, $46, $47,
-         $48, $49,
-         $50, $51, $52, $53, $54,
-         $55, $56, $57,
-         $58, $59, $60, $61, $62,
-         $63, $64, CASE WHEN $62 IS NOT NULL AND $63 IS NOT NULL THEN TRUE ELSE FALSE END,
-         $64
+         $39, $40, $41, $42,
+         $43, $44, $45, $46,
+         $47, $48,
+         $49, $50, $51, $52, $53,
+         $54, $55, $56,
+         $57, $58, $59, $60, $61,
+         $62, $63, CASE WHEN $62 IS NOT NULL AND $63 IS NOT NULL THEN TRUE ELSE FALSE END,
+         $64, $65, $66
        )`,
       [
         propId, title, ownerId, listing_type, displayPrice,
         property_type||null, state||'', lga||'', address||'', landmark||'',
-        img||'', JSON.stringify(images||[]), bedrooms||null, bathrooms||null, toilets||null,
+        img||imageList[0]||'', JSON.stringify(imageList), bedrooms||null, bathrooms||null, toilets||null,
         size_sqm||null, land_size_sqm||null, year_built||null, floors||null, parking_spaces||null,
         description||'', JSON.stringify(amenities||[]), furnishing||null, notes||'',
         new Date().toLocaleString('en-NG'),
@@ -1342,7 +1326,9 @@ async function handleOwnerAddProperty(ownerId, data, res) {
         lease_type, lease_payment_freq, lease_duration_years,
         lease_start_date||null, renewal_option, escalation_pct, permitted_use, prop_condition,
         lat||null, lng||null,
-        JSON.stringify(metadata)
+        JSON.stringify(metadata),
+        video_url || null,
+        JSON.stringify(docList)
       ]
     );
     await logActivity('Owner ' + ownerId + ' listed new ' + listing_type + ' property: ' + title);
