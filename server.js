@@ -1305,7 +1305,7 @@ async function handleOwnerAddProperty(ownerId, data, res) {
          $49, $50, $51, $52, $53,
          $54, $55, $56,
          $57, $58, $59, $60, $61,
-         $62, $63, CASE WHEN $62 IS NOT NULL AND $63 IS NOT NULL THEN TRUE ELSE FALSE END,
+         $62, $63, CASE WHEN $62::text IS NOT NULL AND $63::text IS NOT NULL THEN TRUE ELSE FALSE END,
          $64, $65, $66
        )`,
       [
