@@ -421,8 +421,17 @@ async function handleUserLogin(data, res) {
         [expected, user.id]
       ).catch(e => console.warn('pass_hash update failed:', e.message));
     }
+    // Issue the same owner:<id>:<timestamp> token the /owner/* endpoints and
+    // the owner-dashboard's OTP login already use. Without this, the frontend's
+    // "bridge straight into an owner session on regular login" logic
+    // (GeoAPI.setOwnerSession, wired up in doLogin()) has nothing to store —
+    // data.token is always undefined — so every customer login silently fails
+    // to skip the owner dashboard's separate OTP screen, even after a
+    // successful password login.
+    const token = 'owner:' + user.id + ':' + Date.now();
     json(res, 200, {
       success: true,
+      token,
       user: {
         id:       user.id,
         fname:    user.fname,
@@ -478,7 +487,12 @@ async function handleRegister(data, res) {
     await logActivity('New registration: ' + fname + ' ' + lname + ' (' + (role==='owner'?'Owner':'Renter') + ')');
     sendEmail('admin@geoestate.com.ng', '🆕 New Registration: ' + fname + ' ' + lname, adminAlertEmail({fname,lname,email,phone,role,id:subId}))
       .catch(e => console.warn('Admin alert failed:', e.message));
-    json(res, 200, { success: true, submissionId: subId });
+    // Same gap as /user/login: without this token the frontend's
+    // GeoAPI.setOwnerSession() call after registration has nothing to store,
+    // so a brand-new account still hits the owner dashboard's separate OTP
+    // screen the first time they try to list a property.
+    const token = 'owner:' + subId + ':' + Date.now();
+    json(res, 200, { success: true, submissionId: subId, token });
   } catch(e) {
     console.error('Register error:', e.message);
     json(res, 500, { error: e.message });
