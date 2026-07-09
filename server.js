@@ -1170,6 +1170,22 @@ async function handleOwnerAddProperty(ownerId, data, res) {
     furnishing, notes, property_type, lat, lng
   } = data;
 
+  // ── property_type check-constraint mapping ──────────────────
+  // The DB only allows property_type to be one of:
+  //   single | multi_unit | hotel | commercial
+  // but the listing forms send much more specific values
+  // (flat, house, bungalow, shortlet-villa, office, land, etc).
+  // Map to the closest allowed bucket for the constrained column,
+  // and keep the original specific value in metadata so it isn't lost
+  // for display/search purposes.
+  const PROPERTY_TYPE_MAP = {
+    flat: 'single', house: 'single', room: 'single', bungalow: 'single', land: 'single',
+    'shortlet-apartment': 'hotel', 'shortlet-studio': 'hotel', 'shortlet-villa': 'hotel',
+    office: 'commercial', shop: 'commercial', warehouse: 'commercial'
+  };
+  const property_subtype = property_type || null;
+  const property_type_bucket = PROPERTY_TYPE_MAP[property_type] || 'single';
+
   // ── Media validation: require a minimum number of photos ────
   const imageList = Array.isArray(images) ? images.filter(Boolean) : [];
   if (imageList.length < 3) {
@@ -1192,7 +1208,7 @@ async function handleOwnerAddProperty(ownerId, data, res) {
   let agreement_doc = null;
 
   // ── Metadata JSONB: holds ALL type-specific extras ──────────
-  const metadata = {};
+  const metadata = { property_subtype };
 
   if (listing_type === 'rent') {
     rent_category  = data.rent_category || 'standard';
@@ -1310,7 +1326,7 @@ async function handleOwnerAddProperty(ownerId, data, res) {
        )`,
       [
         propId, title, ownerId, listing_type, displayPrice,
-        property_type||null, state||'', lga||'', address||'', landmark||'',
+        property_type_bucket||null, state||'', lga||'', address||'', landmark||'',
         img||imageList[0]||'', JSON.stringify(imageList), bedrooms||null, bathrooms||null, toilets||null,
         size_sqm||null, land_size_sqm||null, year_built||null, floors||null, parking_spaces||null,
         description||'', JSON.stringify(amenities||[]), furnishing||null, notes||'',
