@@ -546,7 +546,7 @@ async function handlePublicPropertyById(id, res) {
     let prop;
     try {
       const r = await db.query(
-        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE id=$1",
+        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(annual_rent,NULL) as annual_rent,COALESCE(nightly_rate,NULL) as nightly_rate,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,video_url,COALESCE(docs,'[]'::jsonb) as docs,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE id=$1",
         [id]
       );
       if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
@@ -1154,7 +1154,7 @@ async function handleOwnerProperties(ownerId, urlFull, res) {
   try {
     const params = new URL('http://x' + urlFull).searchParams;
     const type = params.get('type');
-    let q = "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE owner_id=$1";
+    let q = "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(annual_rent,NULL) as annual_rent,COALESCE(nightly_rate,NULL) as nightly_rate,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,video_url,COALESCE(docs,'[]'::jsonb) as docs,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE owner_id=$1";
     const args = [ownerId];
     if (type) { args.push(type); q += " AND COALESCE(listing_type,type,'rent')=$" + args.length; }
     q += ' ORDER BY created_at DESC';
@@ -1810,8 +1810,9 @@ async function handleOwnerPropertyDetail(ownerId, propId, res) {
   try {
     const r = await db.query(
       `SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,
-       COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,
-       state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,
+       COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(annual_rent,NULL) as annual_rent,COALESCE(nightly_rate,NULL) as nightly_rate,
+       COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,
+       state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,video_url,COALESCE(docs,'[]'::jsonb) as docs,
        COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,
        COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at
        FROM properties WHERE id=$1 AND owner_id=$2`,
