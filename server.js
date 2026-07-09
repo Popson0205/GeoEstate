@@ -1179,9 +1179,15 @@ async function handleOwnerAddProperty(ownerId, data, res) {
   // and keep the original specific value in metadata so it isn't lost
   // for display/search purposes.
   const PROPERTY_TYPE_MAP = {
-    flat: 'single', house: 'single', room: 'single', bungalow: 'single', land: 'single',
+    // rent form
+    flat: 'single', house: 'single', room: 'single', bungalow: 'single',
     'shortlet-apartment': 'hotel', 'shortlet-studio': 'hotel', 'shortlet-villa': 'hotel',
-    office: 'commercial', shop: 'commercial', warehouse: 'commercial'
+    office: 'commercial', shop: 'commercial', warehouse: 'commercial', land: 'single',
+    // buy form (additional values)
+    terraced: 'single', detached: 'single', 'semi-detached': 'single', mansion: 'single',
+    estate: 'multi_unit',
+    // lease form (additional values)
+    factory: 'commercial', plaza: 'commercial', residential: 'single', 'mixed-use': 'commercial'
   };
   const property_subtype = property_type || null;
   const property_type_bucket = PROPERTY_TYPE_MAP[property_type] || 'single';
