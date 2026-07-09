@@ -923,6 +923,43 @@ async function handleSavePayment(data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+async function handleSubmitPayment(data, res) {
+  // Public endpoint: a buyer/renter just clicked "I've Made the Transfer" on the
+  // website or mobile app. This was previously only reachable via the
+  // admin-authenticated /admin/save-payment route, so customer submissions from
+  // the payment modal were silently dropped (the frontend fetch 404'd and was
+  // swallowed by .catch(()=>{})) and never appeared in the admin payments queue.
+  const {
+    ref, property_id, property_title, buyer_name, buyer_email, buyer_phone,
+    owner, amount, unit_id, unit_label, unit_price, prop, buyer, phone
+  } = data;
+  if (!ref) return json(res, 400, { error: 'Payment ref required' });
+  const rawAmount = Number(unit_price || amount || 0) || 0;
+  const fee = Math.round(rawAmount * 0.10);
+  const ownerAmt = rawAmount - fee;
+  const propLabel = prop || (unit_label ? property_title + ' — ' + unit_label : property_title) || '';
+  try {
+    // Defensive: this is now a public write path (previously only reachable via
+    // admin auth), so make sure the table exists rather than assuming it does.
+    await db.query(`CREATE TABLE IF NOT EXISTS payments (
+      ref TEXT PRIMARY KEY, prop TEXT DEFAULT '', buyer TEXT DEFAULT '',
+      phone TEXT DEFAULT '', owner TEXT DEFAULT '', owner_acct TEXT DEFAULT '',
+      amount NUMERIC DEFAULT 0, fee NUMERIC DEFAULT 0, owner_amt NUMERIC DEFAULT 0,
+      status TEXT DEFAULT 'pending', notified TEXT DEFAULT '', tenancy_id TEXT,
+      confirmed_at TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`).catch(() => {});
+    await db.query(
+      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_confirmation','',NULL)
+       ON CONFLICT (ref) DO NOTHING`,
+      [ref, propLabel, buyer || buyer_name || '', phone || buyer_phone || '', owner || '', '', rawAmount, fee, ownerAmt]
+    );
+    await logActivity('Payment submitted by customer: ' + ref + (property_id ? ' (property ' + property_id + ')' : ''));
+    broadcast('payment_updated', { ref, status: 'pending_confirmation' });
+    json(res, 200, { success: true, ref });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 async function handleGetSync(res) {
   try {
     const [props, regs] = await Promise.all([
@@ -1711,6 +1748,7 @@ const server = http.createServer((req, res) => {
         if (url === '/register')             return handleRegister(data, res);
         if (url === '/user/login')            return handleUserLogin(data, res);
         if (url === '/enquiry')              return handleEnquiry(data, res);
+        if (url === '/submit-payment')       return handleSubmitPayment(data, res);
         if (url === '/upload-sign')           return handleSupabaseUploadSign(data, res);
         if (url === '/submit-dispute')       return handleSubmitDispute(data, res);
 
