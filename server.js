@@ -908,14 +908,19 @@ async function handleGetPayments(res) {
 }
 
 async function handleSavePayment(data, res) {
-  const { ref, prop, buyer, phone, owner, ownerAcct, amount, fee, ownerAmt, status, notified, tenancy_id } = data;
+  const { ref, prop, buyer, phone, owner, ownerAcct, amount, fee, ownerAmt, status, notified, tenancy_id, release_note } = data;
   if (!ref) return json(res, 400, { error: 'Payment ref required' });
   try {
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS release_note TEXT DEFAULT ''`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS released_at TEXT`).catch(() => {});
     await db.query(
-      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-       ON CONFLICT (ref) DO UPDATE SET status=$10, notified=$11, confirmed_at=CASE WHEN $10='confirmed' THEN NOW()::text ELSE payments.confirmed_at END`,
-      [ref, prop||'', buyer||'', phone||'', owner||'', ownerAcct||'', amount||0, fee||0, ownerAmt||0, status||'pending', notified||'', tenancy_id||null]
+      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,release_note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT (ref) DO UPDATE SET status=$10, notified=$11,
+         confirmed_at=CASE WHEN $10='confirmed' THEN NOW()::text ELSE payments.confirmed_at END,
+         release_note=CASE WHEN $13<>'' THEN $13 ELSE payments.release_note END,
+         released_at=CASE WHEN $10='released' THEN NOW()::text ELSE payments.released_at END`,
+      [ref, prop||'', buyer||'', phone||'', owner||'', ownerAcct||'', amount||0, fee||0, ownerAmt||0, status||'pending', notified||'', tenancy_id||null, release_note||'']
     );
     await logActivity('Payment ' + (status||'pending') + ': ' + ref);
     broadcast('payment_updated', { ref, status });
@@ -931,9 +936,10 @@ async function handleSubmitPayment(data, res) {
   // swallowed by .catch(()=>{})) and never appeared in the admin payments queue.
   const {
     ref, property_id, property_title, buyer_name, buyer_email, buyer_phone,
-    owner, amount, unit_id, unit_label, unit_price, prop, buyer, phone
+    owner, amount, unit_id, unit_label, unit_price, prop, buyer, phone, receipt_url
   } = data;
   if (!ref) return json(res, 400, { error: 'Payment ref required' });
+  if (!receipt_url) return json(res, 400, { error: 'Transfer receipt is required' });
   const rawAmount = Number(unit_price || amount || 0) || 0;
   const fee = Math.round(rawAmount * 0.10);
   const ownerAmt = rawAmount - fee;
@@ -948,11 +954,15 @@ async function handleSubmitPayment(data, res) {
       status TEXT DEFAULT 'pending', notified TEXT DEFAULT '', tenancy_id TEXT,
       confirmed_at TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS receipt_url TEXT DEFAULT ''`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS property_id TEXT`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS release_note TEXT DEFAULT ''`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS released_at TEXT`).catch(() => {});
     await db.query(
-      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_confirmation','',NULL)
+      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,receipt_url,property_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_confirmation','',NULL,$10,$11)
        ON CONFLICT (ref) DO NOTHING`,
-      [ref, propLabel, buyer || buyer_name || '', phone || buyer_phone || '', owner || '', '', rawAmount, fee, ownerAmt]
+      [ref, propLabel, buyer || buyer_name || '', phone || buyer_phone || '', owner || '', '', rawAmount, fee, ownerAmt, receipt_url, property_id || null]
     );
     await logActivity('Payment submitted by customer: ' + ref + (property_id ? ' (property ' + property_id + ')' : ''));
     broadcast('payment_updated', { ref, status: 'pending_confirmation' });
