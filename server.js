@@ -900,6 +900,64 @@ async function handleUpdateDispute(id, data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// ── Payment confirmed / released email templates ────────────────────────────
+function paymentConfirmedEmail(p, forOwner) {
+  const heading = forOwner ? '✅ Payment Confirmed — Handover Can Proceed' : '✅ Your Payment Has Been Confirmed';
+  const intro = forOwner
+    ? `GeoEstate has confirmed receipt of the buyer/tenant's transfer for <strong>${p.prop}</strong>. You can now proceed with handover. Funds (minus platform fee) will be released to your account shortly.`
+    : `Good news — we've confirmed your transfer for <strong>${p.prop}</strong>. You can now coordinate handover with the owner/GeoEstate team.`;
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 20px"><tr><td align="center">
+<table width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08)">
+<tr><td style="background:linear-gradient(135deg,#0d3d22,#1a6b3c);padding:24px 32px">
+  <div style="color:#fff;font-size:18px;font-weight:800">📍 ${heading}</div>
+  <div style="color:rgba(255,255,255,.65);font-size:13px;margin-top:4px">Reference ${p.ref}</div>
+</td></tr>
+<tr><td style="padding:32px">
+  <p style="color:#374151;font-size:14px;line-height:1.6">${intro}</p>
+  <table style="width:100%;font-size:14px;border-collapse:collapse;background:#f0fdf4;border-radius:8px;padding:12px;margin-top:8px">
+    <tr><td style="padding:6px 12px;color:#6b7280">Property</td><td style="padding:6px 12px;font-weight:700">${p.prop}</td></tr>
+    <tr><td style="padding:6px 12px;color:#6b7280">${forOwner ? 'Buyer/Tenant' : 'Owner'}</td><td style="padding:6px 12px">${forOwner ? p.buyer : p.owner}</td></tr>
+    <tr><td style="padding:6px 12px;color:#6b7280">Amount Paid</td><td style="padding:6px 12px;font-weight:700">₦${Number(p.amount||0).toLocaleString('en-NG')}</td></tr>
+    ${forOwner ? `<tr><td style="padding:6px 12px;color:#6b7280">You'll Receive</td><td style="padding:6px 12px;font-weight:700;color:#1a6b3c">₦${Number(p.owner_amt||0).toLocaleString('en-NG')}</td></tr>` : ''}
+  </table>
+</td></tr>
+</table></td></tr></table></body></html>`;
+}
+
+function paymentReleasedEmail(p) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 20px"><tr><td align="center">
+<table width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08)">
+<tr><td style="background:linear-gradient(135deg,#0d3d22,#1a6b3c);padding:24px 32px">
+  <div style="color:#fff;font-size:18px;font-weight:800">💸 Funds Released to Your Account</div>
+  <div style="color:rgba(255,255,255,.65);font-size:13px;margin-top:4px">Reference ${p.ref}</div>
+</td></tr>
+<tr><td style="padding:32px">
+  <p style="color:#374151;font-size:14px;line-height:1.6">GeoEstate has released your payout for <strong>${p.prop}</strong>. Please allow up to 24 hours for the transfer to reflect in your bank account.</p>
+  <table style="width:100%;font-size:14px;border-collapse:collapse;background:#f0fdf4;border-radius:8px;padding:12px;margin-top:8px">
+    <tr><td style="padding:6px 12px;color:#6b7280">Property</td><td style="padding:6px 12px;font-weight:700">${p.prop}</td></tr>
+    <tr><td style="padding:6px 12px;color:#6b7280">Amount Released</td><td style="padding:6px 12px;font-weight:700;color:#1a6b3c">₦${Number(p.owner_amt||0).toLocaleString('en-NG')}</td></tr>
+    <tr><td style="padding:6px 12px;color:#6b7280">Platform Fee (10%)</td><td style="padding:6px 12px">₦${Number(p.fee||0).toLocaleString('en-NG')}</td></tr>
+  </table>
+</td></tr>
+</table></td></tr></table></body></html>`;
+}
+
+async function getPropertyOwnerEmail(propertyId) {
+  if (!propertyId) return null;
+  try {
+    const r = await db.query(
+      `SELECT (SELECT email FROM registrations WHERE id=properties.owner_id) as owner_email FROM properties WHERE id=$1`,
+      [propertyId]
+    );
+    return r.rows[0]?.owner_email || null;
+  } catch(e) { return null; }
+}
+
+
 async function handleGetPayments(res) {
   try {
     const r = await db.query('SELECT * FROM payments ORDER BY created_at DESC');
@@ -913,6 +971,14 @@ async function handleSavePayment(data, res) {
   try {
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS release_note TEXT DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS released_at TEXT`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS buyer_email TEXT DEFAULT ''`).catch(() => {});
+    // Look up the row as it stands BEFORE this save so we only notify on an
+    // actual status transition (e.g. don't re-email on every edit to notes).
+    const before = await db.query('SELECT status, property_id, buyer_email FROM payments WHERE ref=$1', [ref]);
+    const prevStatus = before.rows[0]?.status || null;
+    const propertyId = before.rows[0]?.property_id || null;
+    const buyerEmail = before.rows[0]?.buyer_email || '';
+
     await db.query(
       `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,release_note)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
@@ -924,6 +990,20 @@ async function handleSavePayment(data, res) {
     );
     await logActivity('Payment ' + (status||'pending') + ': ' + ref);
     broadcast('payment_updated', { ref, status });
+
+    // Fire owner/buyer emails on an actual transition into confirmed/released.
+    // Never let a notification failure block the save itself.
+    if (status && status !== prevStatus && (status === 'confirmed' || status === 'released')) {
+      const p = { ref, prop, buyer, owner, amount, fee, owner_amt: ownerAmt };
+      const ownerEmail = await getPropertyOwnerEmail(propertyId);
+      if (status === 'confirmed') {
+        if (ownerEmail) sendEmail(ownerEmail, '✅ Payment Confirmed — ' + prop, paymentConfirmedEmail(p, true)).catch(e => console.warn('Owner confirm email failed:', e.message));
+        if (buyerEmail) sendEmail(buyerEmail, '✅ Your Payment Has Been Confirmed', paymentConfirmedEmail(p, false)).catch(e => console.warn('Buyer confirm email failed:', e.message));
+      } else if (status === 'released') {
+        if (ownerEmail) sendEmail(ownerEmail, '💸 Funds Released — ' + prop, paymentReleasedEmail(p)).catch(e => console.warn('Owner release email failed:', e.message));
+      }
+    }
+
     json(res, 200, { success: true });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
@@ -958,11 +1038,12 @@ async function handleSubmitPayment(data, res) {
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS property_id TEXT`).catch(() => {});
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS release_note TEXT DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS released_at TEXT`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS buyer_email TEXT DEFAULT ''`).catch(() => {});
     await db.query(
-      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,receipt_url,property_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_confirmation','',NULL,$10,$11)
+      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,receipt_url,property_id,buyer_email)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_confirmation','',NULL,$10,$11,$12)
        ON CONFLICT (ref) DO NOTHING`,
-      [ref, propLabel, buyer || buyer_name || '', phone || buyer_phone || '', owner || '', '', rawAmount, fee, ownerAmt, receipt_url, property_id || null]
+      [ref, propLabel, buyer || buyer_name || '', phone || buyer_phone || '', owner || '', '', rawAmount, fee, ownerAmt, receipt_url, property_id || null, buyer_email || '']
     );
     await logActivity('Payment submitted by customer: ' + ref + (property_id ? ' (property ' + property_id + ')' : ''));
     broadcast('payment_updated', { ref, status: 'pending_confirmation' });
