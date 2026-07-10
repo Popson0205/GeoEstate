@@ -558,7 +558,7 @@ async function handlePublicPropertyById(id, res) {
     }
     // Try units
     try {
-      const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status,occupied_since,lease_end FROM property_units WHERE property_id=$1 ORDER BY unit_label", [id]);
+      const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status,occupied_since,lease_end,COALESCE(images,'[]'::jsonb) as images,COALESCE(description,'') as description FROM property_units WHERE property_id=$1 ORDER BY unit_label", [id]);
       prop.units = ur.rows;
     } catch(ue) { prop.units = []; }
     json(res, 200, { success: true, property: prop });
@@ -1309,7 +1309,7 @@ async function handleOwnerAddProperty(ownerId, data, res) {
     price, state, lga, address, landmark,
     img, images, video_url, docs, bedrooms, bathrooms, toilets,
     size_sqm, year_built, description, amenities,
-    furnishing, notes, property_type, lat, lng
+    furnishing, notes, property_type, lat, lng, units
   } = data;
 
   // ── property_type check-constraint mapping ──────────────────
@@ -1495,6 +1495,35 @@ async function handleOwnerAddProperty(ownerId, data, res) {
         JSON.stringify(docList)
       ]
     );
+
+    // ── Individual units (optional) ─────────────────────────────
+    // Lets an owner define each separately-rented room/flat/unit right at
+    // listing time (label, price, own photos, description) instead of only
+    // being able to add them one-by-one afterward via "Manage Units". Units
+    // can still be added/edited/removed later through that same screen —
+    // this just seeds it up front when the owner already knows the breakdown.
+    const unitList = Array.isArray(units) ? units.filter(u => u && u.unit_label) : [];
+    if (unitList.length) {
+      try {
+        await db.query(`ALTER TABLE property_units ADD COLUMN IF NOT EXISTS images JSONB DEFAULT '[]'`).catch(() => {});
+        await db.query(`ALTER TABLE property_units ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`).catch(() => {});
+        for (const u of unitList) {
+          await db.query(
+            'INSERT INTO property_units (property_id,unit_label,unit_type,floor_level,capacity,monthly_price,notes,images,description) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+            [
+              propId, u.unit_label, u.unit_type || 'room', u.floor_level || '', u.capacity || 1,
+              u.monthly_price || u.price || null, u.notes || '',
+              JSON.stringify(Array.isArray(u.images) ? u.images : []), u.description || ''
+            ]
+          );
+        }
+      } catch (ue) {
+        // Don't fail the whole listing submission just because unit seeding
+        // hit an issue — the property itself is already saved successfully.
+        console.error('Unit seeding failed for ' + propId + ':', ue.message);
+      }
+    }
+
     await logActivity('Owner ' + ownerId + ' listed new ' + listing_type + ' property: ' + title);
     json(res, 200, {
       success: true,
@@ -1562,8 +1591,12 @@ async function handleGetUnits(ownerId, propId, res) {
       floor_level VARCHAR(20) DEFAULT '', capacity INTEGER DEFAULT 1,
       monthly_price NUMERIC, status VARCHAR(20) DEFAULT 'vacant',
       current_tenant_id TEXT, occupied_since DATE, lease_end DATE,
+      images JSONB DEFAULT '[]', description TEXT DEFAULT '',
       notes TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
     )`).catch(()=>{});
+    // Table may already exist from before images/description were added
+    await db.query(`ALTER TABLE property_units ADD COLUMN IF NOT EXISTS images JSONB DEFAULT '[]'`).catch(()=>{});
+    await db.query(`ALTER TABLE property_units ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`).catch(()=>{});
     const r = await db.query('SELECT * FROM property_units WHERE property_id=$1 ORDER BY unit_label', [propId]);
     const stats = { total: r.rows.length, vacant: 0, occupied: 0, reserved: 0, maintenance: 0 };
     r.rows.forEach(u => { if (stats[u.status] !== undefined) stats[u.status]++; });
@@ -1581,12 +1614,12 @@ async function handleAddUnit(ownerId, propId, data, res) {
     const own = await db.query('SELECT id FROM properties WHERE id=$1 AND owner_id=$2', [propId, ownerId]);
     if (!own.rows.length) return json(res, 403, { error: 'Property not found or not yours' });
   }
-  const { unit_label, unit_type, floor_level, capacity, monthly_price, notes } = data;
+  const { unit_label, unit_type, floor_level, capacity, monthly_price, notes, images, description } = data;
   if (!unit_label) return json(res, 400, { error: 'unit_label required' });
   try {
     const r = await db.query(
-      'INSERT INTO property_units (property_id,unit_label,unit_type,floor_level,capacity,monthly_price,notes) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-      [propId, unit_label, unit_type||'room', floor_level||'', capacity||1, monthly_price||null, notes||'']
+      'INSERT INTO property_units (property_id,unit_label,unit_type,floor_level,capacity,monthly_price,notes,images,description) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+      [propId, unit_label, unit_type||'room', floor_level||'', capacity||1, monthly_price||null, notes||'', JSON.stringify(Array.isArray(images)?images:[]), description||'']
     );
     await logActivity('Unit added: ' + unit_label + ' to property ' + propId);
     json(res, 200, { success: true, unit: r.rows[0] });
@@ -1599,12 +1632,12 @@ async function handleUpdateUnit(ownerId, propId, unitId, data, res) {
     if (!own.rows.length) return json(res, 403, { error: 'Property not found or not yours' });
   }
   try {
-    const allowed = ['unit_label','unit_type','floor_level','capacity','monthly_price','status','current_tenant_id','occupied_since','lease_end','notes'];
+    const allowed = ['unit_label','unit_type','floor_level','capacity','monthly_price','status','current_tenant_id','occupied_since','lease_end','notes','images','description'];
     const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
     if (!fields.length) return json(res, 400, { error: 'No valid fields' });
-    const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');
+    const sets = fields.map(([k],i) => k === 'images' ? `${k}=$${i+2}::jsonb` : `${k}=$${i+2}`).join(',');
     const r = await db.query(`UPDATE property_units SET ${sets},updated_at=NOW() WHERE id=$1 AND property_id=$${fields.length+2} RETURNING *`,
-      [unitId, ...fields.map(([,v])=>v), propId]);
+      [unitId, ...fields.map(([k,v])=> k === 'images' ? JSON.stringify(Array.isArray(v)?v:[]) : v), propId]);
     if (!r.rows.length) return json(res, 404, { error: 'Unit not found' });
     await logActivity('Unit updated: ' + unitId);
     broadcast('unit_updated', { property_id: propId, unit_id: unitId });
@@ -1633,8 +1666,12 @@ async function handleAdminGetUnits(propId, res) {
       floor_level VARCHAR(20) DEFAULT '', capacity INTEGER DEFAULT 1,
       monthly_price NUMERIC, status VARCHAR(20) DEFAULT 'vacant',
       current_tenant_id TEXT, occupied_since DATE, lease_end DATE,
+      images JSONB DEFAULT '[]', description TEXT DEFAULT '',
       notes TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
     )`).catch(()=>{});
+    // Table may already exist from before images/description were added
+    await db.query(`ALTER TABLE property_units ADD COLUMN IF NOT EXISTS images JSONB DEFAULT '[]'`).catch(()=>{});
+    await db.query(`ALTER TABLE property_units ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`).catch(()=>{});
     const r = await db.query('SELECT * FROM property_units WHERE property_id=$1 ORDER BY unit_label', [propId]);
     json(res, 200, { success: true, units: r.rows });
   } catch(e) { json(res, 500, { error: e.message }); }
@@ -1912,7 +1949,7 @@ async function handleOwnerPropertyDetail(ownerId, propId, res) {
     if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
     const prop = r.rows[0];
     try {
-      const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status FROM property_units WHERE property_id=$1 ORDER BY unit_label", [propId]);
+      const ur = await db.query("SELECT id,unit_label,unit_type,floor_level,capacity,monthly_price,status,COALESCE(images,'[]'::jsonb) as images,COALESCE(description,'') as description FROM property_units WHERE property_id=$1 ORDER BY unit_label", [propId]);
       prop.units = ur.rows;
     } catch(e) { prop.units = []; }
     json(res, 200, { success: true, property: prop });

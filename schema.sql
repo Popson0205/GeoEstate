@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS property_units (
   current_tenant_id   TEXT REFERENCES registrations(id),
   occupied_since      DATE,
   lease_end           DATE,
+  images              JSONB DEFAULT '[]',
+  description         TEXT DEFAULT '',
   notes               TEXT DEFAULT '',
   created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -265,6 +267,12 @@ ALTER TABLE properties ADD COLUMN IF NOT EXISTS bathrooms      INTEGER;
 ALTER TABLE properties ADD COLUMN IF NOT EXISTS size_sqm       NUMERIC;
 ALTER TABLE properties ADD COLUMN IF NOT EXISTS description    TEXT DEFAULT '';
 ALTER TABLE properties ADD COLUMN IF NOT EXISTS amenities      JSONB DEFAULT '[]';
+
+-- Per-unit photos and description, so individual rooms/flats/units within a
+-- multi-unit property (hotel rooms, self-cons, 2-bed vs 3-bed flats, etc.)
+-- can each have their own image and write-up, not just a label and price.
+ALTER TABLE property_units ADD COLUMN IF NOT EXISTS images      JSONB DEFAULT '[]';
+ALTER TABLE property_units ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
 
 -- Backfill listing_type from type column on existing rows
 UPDATE properties SET listing_type = type WHERE listing_type IS NULL OR listing_type = '';
