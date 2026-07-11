@@ -1071,7 +1071,13 @@ async function handleSavePayment(data, res) {
             type: propRow.listing_type,
             property: unit_label ? propRow.title + ' — ' + unit_label : (prop || propRow.title),
             property_id: propertyId, unit_id: unitId,
-            tenant: buyer || '', phone: phone || '', owner: owner || propRow.owner || '',
+            // Falls back to a clear placeholder rather than throwing — a
+            // payment can legitimately have no buyer name (e.g. a manual
+            // test entry added directly in admin without one), and a
+            // tenancy record the admin can rename later is far more useful
+            // than silently having none created at all.
+            tenant: buyer || 'Tenant (name not provided — update manually)',
+            phone: phone || '', owner: owner || propRow.owner || '',
             amount: amount || 0, start: startDate, end: endDate,
             notes: 'Auto-created from confirmed payment ' + ref
           });
