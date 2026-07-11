@@ -753,7 +753,7 @@ async function handleAdminUpdate(url, data, res) {
 }
 
 async function handleSaveProperty(data, res) {
-  const { id, title, owner, owner_id, listing_type, type, status, price, monthly_rent, sale_price, lease_price, state, lga, address, img, images, bedrooms, bathrooms, size_sqm, description, amenities, notes } = data;
+  const { id, title, owner, owner_id, listing_type, type, status, price, monthly_rent, sale_price, lease_price, state, lga, address, img, images, bedrooms, bathrooms, size_sqm, description, amenities, notes, lat, lng, geo } = data;
   if (!title) return json(res, 400, { error: 'Title required' });
   const propId = id || ('PROP-' + Date.now());
   const lt = listing_type || type || 'rent';
@@ -771,6 +771,14 @@ async function handleSaveProperty(data, res) {
         `UPDATE properties SET listing_type=$1,monthly_rent=$2,sale_price=$3,lease_price=$4,images=$5,bedrooms=$6,bathrooms=$7,size_sqm=$8,description=$9,amenities=$10 WHERE id=$11`,
         [lt,monthly_rent||null,sale_price||null,lease_price||null,JSON.stringify(images||[]),bedrooms||null,bathrooms||null,size_sqm||null,description||'',JSON.stringify(amenities||[]),propId]
       ).catch(()=>{}); // Silent fail if columns missing — run schema.sql to enable
+      // lat/lng/geo (map pin) — admin edit form's "Location (Map Pin)" fields
+      // were silently dropped on create because this insert never wrote them.
+      if (lat != null || lng != null) {
+        await db.query(
+          `UPDATE properties SET lat=$1,lng=$2,geo=$3 WHERE id=$4`,
+          [lat!=null ? Number(lat) : null, lng!=null ? Number(lng) : null, !!geo, propId]
+        ).catch(()=>{});
+      }
     } catch(e2) { throw e2; }
     await logActivity((id ? 'Property updated: ' : 'Property added: ') + title);
     broadcast('property_created', { id: propId, title, listing_type: lt });
