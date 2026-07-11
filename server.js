@@ -571,7 +571,17 @@ async function handleGetRegistrations(url, res) {
     const since = new URL('http://x' + url).searchParams.get('since');
     let q = 'SELECT * FROM registrations ORDER BY created_at DESC';
     const params = [];
-    if (since) { q = 'SELECT * FROM registrations WHERE created_at > $1 ORDER BY created_at DESC'; params.push(new Date(parseInt(since))); }
+    // Was `WHERE created_at > $1` only — so once a registration had been seen
+    // by one poll, a LATER update (e.g. a customer finishing identity
+    // verification: selfie/doc uploaded, NIN submitted) never showed up on
+    // any subsequent poll, since that's an UPDATE (bumps updated_at) not a
+    // new row (created_at unchanged). The data was genuinely saved in the DB;
+    // the admin's local copy was just frozen at whatever it looked like the
+    // first time it was ever fetched. Catch both new AND updated rows now.
+    if (since) {
+      q = 'SELECT * FROM registrations WHERE created_at > $1 OR updated_at > $1 ORDER BY created_at DESC';
+      params.push(new Date(parseInt(since)));
+    }
     const result = await db.query(q, params);
     const rows = result.rows.map(r => ({
       id: r.id, name: r.fname + ' ' + r.lname,
