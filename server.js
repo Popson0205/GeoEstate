@@ -456,8 +456,26 @@ async function handleRegister(data, res) {
   const pass_hash = data.pass || null;
   const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone, nin } = data; // FIX 2: added nin
   try {
-    const exists = await db.query('SELECT id FROM registrations WHERE email = $1', [email.toLowerCase()]);
-    if (exists.rows.length) return json(res, 200, { success: true, message: 'Already registered' });
+    const exists = await db.query('SELECT id, is_verified FROM registrations WHERE email = $1', [email.toLowerCase()]);
+    if (exists.rows.length) {
+      // Was returning {success:true} with NO submissionId at all. The
+      // frontend's sessionUser.id = regData.submissionId || ('USR-'+Date.now())
+      // fallback then generated a brand-new ID matching no real row in the
+      // DB. Every action after that — most importantly identity verification
+      // (selfie/ID doc upload) — silently targeted a nonexistent row: the
+      // UPDATE matched zero rows (not a SQL error), so the frontend reported
+      // success while nothing was ever actually saved against the person's
+      // real registration. This is very likely what happened for anyone
+      // whose files "definitely uploaded" but never appeared in admin. Now
+      // returns the real existing ID so a repeat signup attempt (closed the
+      // app mid-OTP, tried again, etc. — an easy thing to do) still lets
+      // them log in and continue against their actual record.
+      const ownerToken = 'owner:' + exists.rows[0].id + ':' + Date.now();
+      return json(res, 200, {
+        success: true, message: 'Already registered', submissionId: exists.rows[0].id,
+        token: ownerToken, alreadyVerified: !!exists.rows[0].is_verified
+      });
+    }
     const subId = id || ('USR-' + Date.now());
     // Try full insert with all extended fields, fall back to minimal
     try {
@@ -1361,12 +1379,28 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
   try {
     // Check if already verified
     const r = await db.query('SELECT is_verified FROM registrations WHERE id=$1', [ownerId]);
+    if (!r.rows.length) {
+      // This is the real bug behind "I uploaded my documents and they're
+      // definitely somewhere, but admin shows nothing": ownerId (from the
+      // session token) didn't match any registrations row at all -- a stale
+      // token, or verifying moments after signup before the row had fully
+      // committed. The selfie/ID files themselves upload fine (they go
+      // straight to Supabase Storage, unrelated to this row), so from the
+      // user's side it looks like "my documents are already saved" -- but
+      // nothing ever linked those file URLs back to their registration,
+      // because there was no registration row to update. Previously this
+      // silently returned success from the block below (an UPDATE matching
+      // zero rows isn't a SQL error), so the person genuinely believed it
+      // worked. Fail loudly now so the frontend can tell them to re-login.
+      return json(res, 404, { error: 'We could not find your account — please sign out and log back in, then try again.' });
+    }
     if (r.rows[0]?.is_verified) return json(res, 200, { success: true, alreadyVerified: true, message: 'Already verified — no action needed.' });
 
     const { nin, doc_type, doc_url, selfie_url, other_doc_url, dob, gender, occupation, employer, state, lga, address, next_of_kin, next_of_kin_rel, next_of_kin_phone } = data;
     // Try full update with all fields, fall back to minimal if columns missing
+    let updateResult;
     try {
-      await db.query(
+      updateResult = await db.query(
         `UPDATE registrations SET
           nin=$1, doc=$2, is_verified=false, status=$3,
           dob=COALESCE(NULLIF($5,''),dob),
@@ -1392,10 +1426,15 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
       );
     } catch(e) {
       // Fallback: minimal update if extended columns don't exist
-      await db.query(
+      updateResult = await db.query(
         'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, photo_url=COALESCE(NULLIF($5,\'\'),photo_url), id_doc_url=COALESCE(NULLIF($6,\'\'),id_doc_url), updated_at=NOW() WHERE id=$4',
         [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId, selfie_url||'', doc_url||'']
       );
+    }
+    // Same guard as above, after the actual save attempt: if this matched
+    // zero rows, nothing was persisted -- don't report success.
+    if (!updateResult || updateResult.rowCount === 0) {
+      return json(res, 404, { error: 'We could not save your verification — please sign out and log back in, then try again.' });
     }
     await logActivity('Owner identity submitted for review: ' + ownerId);
     json(res, 200, { success: true, message: 'Identity submitted. You will be notified once verified (usually within 24 hours).' });
