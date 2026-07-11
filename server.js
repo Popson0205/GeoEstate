@@ -808,25 +808,32 @@ async function handleSaveTeamMember(data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// Shared by both manual tenancy entry (handleSaveTenancy) and automatic
+// tenancy creation on payment confirmation (handleSavePayment) — one place
+// for the actual INSERT + occupied-unit side effect, so both paths stay
+// in sync and neither can silently drift from the other.
+async function createTenancyRecord(t) {
+  const { ref, type, property, property_id, unit_id, tenant, tenant_id, phone, owner, amount, start, end, notes } = t;
+  if (!property || !tenant || !end) throw new Error('Property, tenant and end date required');
+  await db.query(
+    `INSERT INTO tenancies (ref,type,property,property_id,unit_id,tenant,tenant_id,phone,owner,amount,start_date,end_date,notes)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     ON CONFLICT (ref) DO NOTHING`,
+    [ref||('TEN-'+Date.now()),type||'rent',property,property_id||null,unit_id||null,tenant,tenant_id||null,phone||'',owner||'',amount||0,start,end,notes||'']
+  );
+  if (unit_id) {
+    await db.query("UPDATE property_units SET status='occupied', current_tenant_id=$1, occupied_since=$2, lease_end=$3 WHERE id=$4",
+      [tenant_id||null, start, end, unit_id]);
+  }
+  await logActivity('Tenancy added: ' + (ref||'') + ' — ' + property);
+  broadcast('tenancy_created', { property });
+}
+
 async function handleSaveTenancy(data, res) {
-  const { ref, type, property, property_id, unit_id, tenant, tenant_id, phone, owner, amount, start, end, notes } = data;
-  if (!property || !tenant || !end) return json(res, 400, { error: 'Property, tenant and end date required' });
   try {
-    await db.query(
-      `INSERT INTO tenancies (ref,type,property,property_id,unit_id,tenant,tenant_id,phone,owner,amount,start_date,end_date,notes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-       ON CONFLICT (ref) DO NOTHING`,
-      [ref||('TEN-'+Date.now()),type||'rent',property,property_id||null,unit_id||null,tenant,tenant_id||null,phone||'',owner||'',amount||0,start,end,notes||'']
-    );
-    // If unit_id provided, mark unit as occupied
-    if (unit_id) {
-      await db.query("UPDATE property_units SET status='occupied', current_tenant_id=$1, occupied_since=$2, lease_end=$3 WHERE id=$4",
-        [tenant_id||null, start, end, unit_id]);
-    }
-    await logActivity('Tenancy added: ' + ref + ' — ' + property);
-    broadcast('tenancy_created', { property });
+    await createTenancyRecord(data);
     json(res, 200, { success: true });
-  } catch(e) { json(res, 500, { error: e.message }); }
+  } catch(e) { json(res, e.message.includes('required') ? 400 : 500, { error: e.message }); }
 }
 
 async function handleDeleteTeamMember(id, res) {
@@ -966,34 +973,39 @@ async function handleGetPayments(res) {
 }
 
 async function handleSavePayment(data, res) {
-  const { ref, prop, buyer, phone, owner, ownerAcct, amount, fee, ownerAmt, status, notified, tenancy_id, release_note } = data;
+  const { ref, prop, buyer, phone, owner, ownerAcct, amount, fee, ownerAmt, status, notified, tenancy_id, release_note, property_id: propertyIdIn, unit_id: unitIdIn, unit_label, start, end } = data;
   if (!ref) return json(res, 400, { error: 'Payment ref required' });
   try {
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS release_note TEXT DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS released_at TEXT`).catch(() => {});
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS buyer_email TEXT DEFAULT ''`).catch(() => {});
-    // Look up the row as it stands BEFORE this save so we only notify on an
-    // actual status transition (e.g. don't re-email on every edit to notes).
-    const before = await db.query('SELECT status, property_id, buyer_email FROM payments WHERE ref=$1', [ref]);
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS unit_id INTEGER`).catch(() => {});
+    // Look up the row as it stands BEFORE this save so we only notify (and
+    // auto-create a tenancy) on an actual status transition — e.g. editing
+    // notes on an already-confirmed payment shouldn't re-fire either.
+    const before = await db.query('SELECT status, property_id, buyer_email, unit_id FROM payments WHERE ref=$1', [ref]);
     const prevStatus = before.rows[0]?.status || null;
-    const propertyId = before.rows[0]?.property_id || null;
+    const propertyId = propertyIdIn || before.rows[0]?.property_id || null;
     const buyerEmail = before.rows[0]?.buyer_email || '';
+    const unitId = unitIdIn || before.rows[0]?.unit_id || null;
 
     await db.query(
-      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,release_note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,release_note,unit_id,property_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        ON CONFLICT (ref) DO UPDATE SET status=$10, notified=$11,
          confirmed_at=CASE WHEN $10='confirmed' THEN NOW()::text ELSE payments.confirmed_at END,
          release_note=CASE WHEN $13<>'' THEN $13 ELSE payments.release_note END,
-         released_at=CASE WHEN $10='released' THEN NOW()::text ELSE payments.released_at END`,
-      [ref, prop||'', buyer||'', phone||'', owner||'', ownerAcct||'', amount||0, fee||0, ownerAmt||0, status||'pending', notified||'', tenancy_id||null, release_note||'']
+         released_at=CASE WHEN $10='released' THEN NOW()::text ELSE payments.released_at END,
+         unit_id=COALESCE($14, payments.unit_id), property_id=COALESCE($15, payments.property_id)`,
+      [ref, prop||'', buyer||'', phone||'', owner||'', ownerAcct||'', amount||0, fee||0, ownerAmt||0, status||'pending', notified||'', tenancy_id||null, release_note||'', unitId, propertyId]
     );
     await logActivity('Payment ' + (status||'pending') + ': ' + ref);
     broadcast('payment_updated', { ref, status });
 
     // Fire owner/buyer emails on an actual transition into confirmed/released.
     // Never let a notification failure block the save itself.
-    if (status && status !== prevStatus && (status === 'confirmed' || status === 'released')) {
+    const isNewTransition = status && status !== prevStatus;
+    if (isNewTransition && (status === 'confirmed' || status === 'released')) {
       const p = { ref, prop, buyer, owner, amount, fee, owner_amt: ownerAmt };
       const ownerEmail = await getPropertyOwnerEmail(propertyId);
       if (status === 'confirmed') {
@@ -1007,12 +1019,44 @@ async function handleSavePayment(data, res) {
     // Keep a linked shortlet booking (if any) in sync with the payment: a
     // confirmed/released payment locks those dates in for real; a disputed
     // or reverted-to-pending payment frees them back up for other guests.
-    if (status && status !== prevStatus) {
+    if (isNewTransition) {
       await db.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ref TEXT`).catch(() => {});
       if (status === 'confirmed' || status === 'released') {
         await db.query(`UPDATE bookings SET status='confirmed' WHERE ref=$1`, [ref]).catch(() => {});
       } else if (status === 'disputed') {
         await db.query(`UPDATE bookings SET status='cancelled' WHERE ref=$1`, [ref]).catch(() => {});
+      }
+    }
+
+    // Auto-create a Tenancy Tracker record the moment a rent/lease payment
+    // is confirmed — previously this required a fully separate manual
+    // "Add Tenancy" entry, duplicating data already on the payment itself.
+    // Buy transactions don't get a tenancy (no ongoing occupancy to track).
+    if (isNewTransition && status === 'confirmed' && propertyId) {
+      try {
+        const propR = await db.query(
+          "SELECT title, owner, COALESCE(listing_type,type,'rent') as listing_type, COALESCE(lease_duration_years,1) as lease_duration_years FROM properties WHERE id=$1",
+          [propertyId]
+        );
+        const propRow = propR.rows[0];
+        if (propRow && (propRow.listing_type === 'rent' || propRow.listing_type === 'lease')) {
+          const startDate = start || new Date().toISOString().slice(0, 10);
+          const years = propRow.listing_type === 'lease' ? (Number(propRow.lease_duration_years) || 1) : 1;
+          const endDate = end || new Date(new Date(startDate).setFullYear(new Date(startDate).getFullYear() + years)).toISOString().slice(0, 10);
+          await createTenancyRecord({
+            ref: 'TEN-FROM-' + ref,
+            type: propRow.listing_type,
+            property: unit_label ? propRow.title + ' — ' + unit_label : (prop || propRow.title),
+            property_id: propertyId, unit_id: unitId,
+            tenant: buyer || '', phone: phone || '', owner: owner || propRow.owner || '',
+            amount: amount || 0, start: startDate, end: endDate,
+            notes: 'Auto-created from confirmed payment ' + ref
+          });
+        }
+      } catch (te) {
+        // Never let tenancy auto-creation break the payment confirmation
+        // itself — the payment is already saved successfully by this point.
+        console.error('Auto tenancy creation failed for payment ' + ref + ':', te.message);
       }
     }
 
@@ -1124,11 +1168,12 @@ async function handleSubmitPayment(data, res) {
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS release_note TEXT DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS released_at TEXT`).catch(() => {});
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS buyer_email TEXT DEFAULT ''`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS unit_id INTEGER`).catch(() => {});
     await db.query(
-      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,receipt_url,property_id,buyer_email)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_confirmation','',NULL,$10,$11,$12)
+      `INSERT INTO payments (ref,prop,buyer,phone,owner,owner_acct,amount,fee,owner_amt,status,notified,tenancy_id,receipt_url,property_id,buyer_email,unit_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_confirmation','',NULL,$10,$11,$12,$13)
        ON CONFLICT (ref) DO NOTHING`,
-      [ref, propLabel, buyer || buyer_name || '', phone || buyer_phone || '', owner || '', '', rawAmount, fee, ownerAmt, receipt_url, property_id || null, buyer_email || '']
+      [ref, propLabel, buyer || buyer_name || '', phone || buyer_phone || '', owner || '', '', rawAmount, fee, ownerAmt, receipt_url, property_id || null, buyer_email || '', unit_id || null]
     );
     await logActivity('Payment submitted by customer: ' + ref + (property_id ? ' (property ' + property_id + ')' : ''));
     broadcast('payment_updated', { ref, status: 'pending_confirmation' });

@@ -192,6 +192,8 @@ CREATE TABLE IF NOT EXISTS payments (
   confirmed_at    TEXT,
   released_at     TEXT,
   tenancy_id      INTEGER REFERENCES tenancies(id),
+  unit_id         INTEGER REFERENCES property_units(id),
+  property_id     TEXT REFERENCES properties(id),
   notes           TEXT DEFAULT '',
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -273,6 +275,12 @@ ALTER TABLE properties ADD COLUMN IF NOT EXISTS amenities      JSONB DEFAULT '[]
 -- can each have their own image and write-up, not just a label and price.
 ALTER TABLE property_units ADD COLUMN IF NOT EXISTS images      JSONB DEFAULT '[]';
 ALTER TABLE property_units ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
+
+-- Lets a confirmed payment be traced back to the exact unit/property it was
+-- for, so confirming it can automatically create a Tenancy Tracker record
+-- (see handleSavePayment) instead of requiring a separate manual entry.
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS unit_id     INTEGER REFERENCES property_units(id);
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS property_id TEXT REFERENCES properties(id);
 
 -- Backfill listing_type from type column on existing rows
 UPDATE properties SET listing_type = type WHERE listing_type IS NULL OR listing_type = '';
