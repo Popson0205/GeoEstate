@@ -1013,6 +1013,7 @@ async function handleGetPayments(res) {
 async function handleSavePayment(data, res) {
   const { ref, prop, buyer, phone, owner, ownerAcct, amount, fee, ownerAmt, status, notified, tenancy_id, release_note, property_id: propertyIdIn, unit_id: unitIdIn, unit_label, start, end } = data;
   if (!ref) return json(res, 400, { error: 'Payment ref required' });
+  console.log('[save-payment] incoming ref=' + ref + ' status=' + status + ' property_id=' + propertyIdIn + ' unit_id=' + unitIdIn);
   try {
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS release_note TEXT DEFAULT ''`).catch(() => {});
     await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS released_at TEXT`).catch(() => {});
@@ -1043,6 +1044,7 @@ async function handleSavePayment(data, res) {
     // Fire owner/buyer emails on an actual transition into confirmed/released.
     // Never let a notification failure block the save itself.
     const isNewTransition = status && status !== prevStatus;
+    console.log('[save-payment] ref=' + ref + ' prevStatus=' + prevStatus + ' newStatus=' + status + ' isNewTransition=' + isNewTransition + ' resolvedPropertyId=' + propertyId + ' resolvedUnitId=' + unitId);
     if (isNewTransition && (status === 'confirmed' || status === 'released')) {
       const p = { ref, prop, buyer, owner, amount, fee, owner_amt: ownerAmt };
       const ownerEmail = await getPropertyOwnerEmail(propertyId);
@@ -1077,6 +1079,7 @@ async function handleSavePayment(data, res) {
           [propertyId]
         );
         const propRow = propR.rows[0];
+        console.log('[save-payment] tenancy check ref=' + ref + ' propertyRow=' + JSON.stringify(propRow));
         if (propRow && (propRow.listing_type === 'rent' || propRow.listing_type === 'lease')) {
           const startDate = start || new Date().toISOString().slice(0, 10);
           const years = propRow.listing_type === 'lease' ? (Number(propRow.lease_duration_years) || 1) : 1;
@@ -1086,16 +1089,27 @@ async function handleSavePayment(data, res) {
             type: propRow.listing_type,
             property: unit_label ? propRow.title + ' — ' + unit_label : (prop || propRow.title),
             property_id: propertyId, unit_id: unitId,
-            tenant: buyer || '', phone: phone || '', owner: owner || propRow.owner || '',
+            // Falls back to a clear placeholder rather than throwing — a
+            // payment can legitimately have no buyer name (e.g. a manual
+            // test entry added directly in admin without one), and a
+            // tenancy record the admin can rename later is far more useful
+            // than silently having none created at all.
+            tenant: buyer || 'Tenant (name not provided — update manually)',
+            phone: phone || '', owner: owner || propRow.owner || '',
             amount: amount || 0, start: startDate, end: endDate,
             notes: 'Auto-created from confirmed payment ' + ref
           });
+          console.log('[save-payment] tenancy auto-created for ref=' + ref + ' as TEN-FROM-' + ref);
+        } else {
+          console.log('[save-payment] tenancy SKIPPED for ref=' + ref + ' — property not found or listing_type is neither rent nor lease (got: ' + (propRow ? propRow.listing_type : 'no property row') + ')');
         }
       } catch (te) {
         // Never let tenancy auto-creation break the payment confirmation
         // itself — the payment is already saved successfully by this point.
         console.error('Auto tenancy creation failed for payment ' + ref + ':', te.message);
       }
+    } else if (status === 'confirmed') {
+      console.log('[save-payment] tenancy auto-create NOT ATTEMPTED for ref=' + ref + ' — isNewTransition=' + isNewTransition + ' propertyId=' + propertyId + ' (need isNewTransition=true AND a resolvable property_id)');
     }
 
     json(res, 200, { success: true });
