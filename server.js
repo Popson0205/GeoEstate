@@ -1004,8 +1004,71 @@ async function handleSavePayment(data, res) {
       }
     }
 
+    // Keep a linked shortlet booking (if any) in sync with the payment: a
+    // confirmed/released payment locks those dates in for real; a disputed
+    // or reverted-to-pending payment frees them back up for other guests.
+    if (status && status !== prevStatus) {
+      await db.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ref TEXT`).catch(() => {});
+      if (status === 'confirmed' || status === 'released') {
+        await db.query(`UPDATE bookings SET status='confirmed' WHERE ref=$1`, [ref]).catch(() => {});
+      } else if (status === 'disputed') {
+        await db.query(`UPDATE bookings SET status='cancelled' WHERE ref=$1`, [ref]).catch(() => {});
+      }
+    }
+
     json(res, 200, { success: true });
   } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// ── Shortlet booking / availability ──────────────────────────────────────────
+async function ensureBookingsTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS bookings (
+    id SERIAL PRIMARY KEY,
+    property_id TEXT NOT NULL,
+    ref TEXT,
+    check_in DATE NOT NULL,
+    check_out DATE NOT NULL,
+    guest_name TEXT DEFAULT '',
+    guest_email TEXT DEFAULT '',
+    guest_phone TEXT DEFAULT '',
+    nights INTEGER DEFAULT 0,
+    amount NUMERIC DEFAULT 0,
+    status TEXT DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`).catch(() => {});
+}
+
+async function handleGetAvailability(propertyId, res) {
+  try {
+    await ensureBookingsTable();
+    // Confirmed bookings always block their dates. Pending ones (payment
+    // submitted, not yet admin-confirmed) only block for 48h -- past that,
+    // treat the hold as abandoned so an unconfirmed transfer can't
+    // permanently lock a guest out of those dates.
+    const r = await db.query(
+      `SELECT check_in, check_out FROM bookings
+       WHERE property_id=$1 AND status<>'cancelled'
+         AND (status='confirmed' OR created_at > NOW() - INTERVAL '48 hours')`,
+      [propertyId]
+    );
+    const fmt = d => (d instanceof Date) ? d.toISOString().slice(0,10) : String(d).slice(0,10);
+    json(res, 200, { success: true, booked: r.rows.map(row => ({ check_in: fmt(row.check_in), check_out: fmt(row.check_out) })) });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// Returns null if the range is free, or an error string if it overlaps an
+// existing (non-cancelled, non-stale-pending) booking.
+async function checkBookingConflict(propertyId, checkIn, checkOut) {
+  await ensureBookingsTable();
+  const r = await db.query(
+    `SELECT 1 FROM bookings
+     WHERE property_id=$1 AND status<>'cancelled'
+       AND (status='confirmed' OR created_at > NOW() - INTERVAL '48 hours')
+       AND check_in < $3 AND check_out > $2
+     LIMIT 1`,
+    [propertyId, checkIn, checkOut]
+  );
+  return r.rows.length ? 'Those dates are no longer available — please pick different dates.' : null;
 }
 
 async function handleSubmitPayment(data, res) {
@@ -1016,11 +1079,33 @@ async function handleSubmitPayment(data, res) {
   // swallowed by .catch(()=>{})) and never appeared in the admin payments queue.
   const {
     ref, property_id, property_title, buyer_name, buyer_email, buyer_phone,
-    owner, amount, unit_id, unit_label, unit_price, prop, buyer, phone, receipt_url
+    owner, amount, unit_id, unit_label, unit_price, prop, buyer, phone, receipt_url,
+    check_in, check_out
   } = data;
   if (!ref) return json(res, 400, { error: 'Payment ref required' });
   if (!receipt_url) return json(res, 400, { error: 'Transfer receipt is required' });
-  const rawAmount = Number(unit_price || amount || 0) || 0;
+
+  let rawAmount = Number(unit_price || amount || 0) || 0;
+  let nights = 0;
+
+  // Shortlet booking: dates were sent, so compute the authoritative amount
+  // server-side from the property's real nightly_rate (never trust a
+  // client-computed total) and reject if those dates just got taken.
+  if (check_in && check_out) {
+    if (!property_id) return json(res, 400, { error: 'property_id required for a dated booking' });
+    const ci = new Date(check_in), co = new Date(check_out);
+    if (isNaN(ci) || isNaN(co) || co <= ci) return json(res, 400, { error: 'Invalid check-in/check-out dates' });
+    nights = Math.round((co - ci) / 86400000);
+    try {
+      const propR = await db.query('SELECT nightly_rate FROM properties WHERE id=$1', [property_id]);
+      const nightlyRate = Number(propR.rows[0]?.nightly_rate || 0);
+      if (!nightlyRate) return json(res, 400, { error: 'This property has no nightly rate set' });
+      rawAmount = nightlyRate * nights;
+      const conflict = await checkBookingConflict(property_id, check_in, check_out);
+      if (conflict) return json(res, 409, { error: conflict });
+    } catch(e) { return json(res, 500, { error: e.message }); }
+  }
+
   const fee = Math.round(rawAmount * 0.10);
   const ownerAmt = rawAmount - fee;
   const propLabel = prop || (unit_label ? property_title + ' — ' + unit_label : property_title) || '';
@@ -1047,7 +1132,33 @@ async function handleSubmitPayment(data, res) {
     );
     await logActivity('Payment submitted by customer: ' + ref + (property_id ? ' (property ' + property_id + ')' : ''));
     broadcast('payment_updated', { ref, status: 'pending_confirmation' });
-    json(res, 200, { success: true, ref });
+
+    if (check_in && check_out && nights > 0) {
+      await ensureBookingsTable();
+      const bookingR = await db.query(
+        `INSERT INTO bookings (property_id, ref, check_in, check_out, guest_name, guest_email, guest_phone, nights, amount, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') RETURNING id`,
+        [property_id, ref, check_in, check_out, buyer || buyer_name || '', buyer_email || '', phone || buyer_phone || '', nights, rawAmount]
+      );
+      // Narrow (not eliminate) the check-then-insert race: re-verify no other
+      // booking for these dates snuck in between the earlier check and this
+      // insert. A true guarantee needs a DB-level exclusion constraint; this
+      // is a reasonable mitigation for a manually-reviewed booking flow.
+      const dupe = await db.query(
+        `SELECT 1 FROM bookings
+         WHERE property_id=$1 AND id<>$2 AND status<>'cancelled'
+           AND (status='confirmed' OR created_at > NOW() - INTERVAL '48 hours')
+           AND check_in < $4 AND check_out > $3 LIMIT 1`,
+        [property_id, bookingR.rows[0].id, check_in, check_out]
+      );
+      if (dupe.rows.length) {
+        await db.query(`UPDATE bookings SET status='cancelled' WHERE id=$1`, [bookingR.rows[0].id]);
+        await db.query(`UPDATE payments SET status='cancelled' WHERE ref=$1`, [ref]);
+        return json(res, 409, { error: 'Those dates were just booked by someone else — please pick different dates.' });
+      }
+    }
+
+    json(res, 200, { success: true, ref, amount: rawAmount, nights: nights || undefined });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
@@ -1791,6 +1902,7 @@ const server = http.createServer((req, res) => {
 
     // Public — no auth required
     if (url === '/properties')               return handlePublicProperties(urlFull, res);
+    if (url.match(/^\/properties\/([^/]+)\/availability$/)) return handleGetAvailability(url.split('/')[2], res);
     if (url.match(/^\/properties\/([^/]+)$/)) return handlePublicPropertyById(url.split('/')[2], res);
     if (url === '/events')                   return handleSSE(req, res);
 
