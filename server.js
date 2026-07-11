@@ -1402,21 +1402,6 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
-async function handleOwnerUpdatePhoto(ownerId, data, res) {
-  try {
-    const photo_url = (data && data.photo_url || '').trim();
-    if (!photo_url) return json(res, 400, { error: 'photo_url is required' });
-    // Only accept a real uploaded URL — never a base64/data URI, which would
-    // silently overwrite the on-file photo with something that lives only
-    // in one browser's localStorage.
-    if (!/^https?:\/\//i.test(photo_url)) {
-      return json(res, 400, { error: 'photo_url must be a real uploaded file URL' });
-    }
-    await db.query('UPDATE registrations SET photo_url=$1, updated_at=NOW() WHERE id=$2', [photo_url, ownerId]);
-    json(res, 200, { success: true, photo_url });
-  } catch(e) { json(res, 500, { error: e.message }); }
-}
-
 async function handleOwnerProperties(ownerId, urlFull, res) {
   try {
     const params = new URL('http://x' + urlFull).searchParams;
@@ -2066,7 +2051,6 @@ const server = http.createServer((req, res) => {
           const ownerId = requireOwner(req, res);
           if (!ownerId) return;
           if (url === '/owner/verify-identity') return handleOwnerVerifyIdentity(ownerId, data, res);
-          if (url === '/owner/update-photo')    return handleOwnerUpdatePhoto(ownerId, data, res);
           if (url === '/owner/add-property')    return handleOwnerAddProperty(ownerId, data, res);
           const owPropMatch = url.match(/^\/owner\/property\/([^/]+)$/);
           if (owPropMatch) return handleOwnerUpdateProperty(ownerId, owPropMatch[1], data, res);
