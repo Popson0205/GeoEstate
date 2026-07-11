@@ -601,6 +601,8 @@ async function handleGetProperties(res) {
         COALESCE(listing_type, type, 'rent') as listing_type,
         status, price,
         COALESCE(monthly_rent, CASE WHEN type='rent' THEN NULL ELSE NULL END) as monthly_rent,
+        COALESCE(annual_rent, NULL) as annual_rent,
+        COALESCE(nightly_rate, NULL) as nightly_rate,
         COALESCE(sale_price, NULL) as sale_price,
         COALESCE(lease_price, NULL) as lease_price,
         state, lga, address, img,
