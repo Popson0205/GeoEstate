@@ -1055,7 +1055,7 @@ async function handleSavePayment(data, res) {
     if (isNewTransition && status === 'confirmed' && propertyId) {
       try {
         const propR = await db.query(
-          "SELECT title, owner, COALESCE(listing_type,type,'rent') as listing_type, COALESCE(lease_duration_years,1) as lease_duration_years FROM properties WHERE id=$1",
+          "SELECT title, owner, COALESCE(listing_type,type,'rent') as listing_type, COALESCE(lease_duration_years::text,'1') as lease_duration_years FROM properties WHERE id=$1",
           [propertyId]
         );
         const propRow = propR.rows[0];
