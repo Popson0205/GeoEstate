@@ -699,6 +699,34 @@ async function handleGetTenancies(res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// Owner-scoped Tenancy Tracker — same shape as the admin version, but joined
+// against properties so an owner only ever sees tenancies on properties they
+// actually own (tenancies has no owner_id column of its own, only the
+// free-text 'owner' name field, which isn't reliable enough to filter on —
+// property_id -> properties.owner_id is the real, trustworthy link).
+async function handleOwnerTenancies(ownerId, res) {
+  try {
+    const result = await db.query(`
+      SELECT t.*,
+        CASE WHEN t.end_date <= CURRENT_DATE + INTERVAL '30 days' AND t.status='active' THEN true ELSE false END as expiring_soon
+      FROM tenancies t
+      JOIN properties p ON p.id = t.property_id
+      WHERE p.owner_id = $1
+      ORDER BY t.end_date ASC
+    `, [ownerId]);
+    const rows = result.rows.map(r => ({
+      id: r.id, ref: r.ref, type: r.type, property: r.property,
+      propertyId: r.property_id, unitId: r.unit_id,
+      tenant: r.tenant, tenantId: r.tenant_id, phone: r.phone, owner: r.owner,
+      amount: r.amount, start: r.start_date, end: r.end_date,
+      status: r.status, packingOutDate: r.packing_out_date,
+      renewedAt: r.renewed_at, vacatedAt: r.vacated_at, notes: r.notes,
+      expiringSoon: r.expiring_soon
+    }));
+    json(res, 200, { success: true, tenancies: rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 async function handleAdminUpdate(url, data, res) {
   const regMatch = url.match(/^\/admin\/registration\/([^/]+)$/);
   if (regMatch) {
@@ -2085,6 +2113,7 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/profile')          return handleOwnerProfile(ownerId, res);
       if (url === '/owner/properties')       return handleOwnerProperties(ownerId, urlFull, res);
       if (url === '/owner/enquiries')        return handleOwnerEnquiries(ownerId, res);
+      if (url === '/owner/tenancies')        return handleOwnerTenancies(ownerId, res);
       const propDetailMatch = url.match(/^\/owner\/property\/([^/]+)\/detail$/);
       if (propDetailMatch) return handleOwnerPropertyDetail(ownerId, propDetailMatch[1], res);
       const unitMatch = url.match(/^\/owner\/property\/([^/]+)\/units$/);
