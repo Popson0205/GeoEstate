@@ -874,6 +874,33 @@ async function handleSaveTenancy(data, res) {
   } catch(e) { json(res, e.message.includes('required') ? 400 : 500, { error: e.message }); }
 }
 
+// Removes a property from public/live listing once it's no longer available
+// — but for a multi-unit property, only once EVERY unit has been taken.
+// A single vacant room/flat should keep the whole property visible (with
+// that unit correctly marked occupied on its own card); the property itself
+// only comes down once there's nothing left for a customer to select.
+// listingType decides the terminal status: 'sold' for buy, 'completed' for
+// rent/lease — both already recognized by admin.html's Manage Properties
+// view (it already filters on exactly these two values).
+async function maybeDelistProperty(propertyId, listingType) {
+  try {
+    const unitsR = await db.query(
+      "SELECT COUNT(*)::int as total, COUNT(*) FILTER (WHERE status='vacant')::int as vacant FROM property_units WHERE property_id=$1",
+      [propertyId]
+    );
+    const { total, vacant } = unitsR.rows[0];
+    if (total > 0 && vacant > 0) return; // still has at least one vacant unit — keep it live
+    const terminalStatus = listingType === 'buy' ? 'sold' : 'completed';
+    const r = await db.query("UPDATE properties SET status=$1, updated_at=NOW() WHERE id=$2 AND status='live' RETURNING id", [terminalStatus, propertyId]);
+    if (r.rows.length) {
+      await logActivity('Property ' + propertyId + ' automatically delisted as ' + terminalStatus + (total > 0 ? ' (all units taken)' : ''));
+      broadcast('property_updated', { id: propertyId, status: terminalStatus });
+    }
+  } catch (e) {
+    console.error('maybeDelistProperty failed for ' + propertyId + ':', e.message);
+  }
+}
+
 async function handleDeleteTeamMember(id, res) {
   try { await db.query('DELETE FROM team_members WHERE id=$1', [id]); json(res, 200, { success: true }); }
   catch(e) { json(res, 500, { error: e.message }); }
@@ -1071,16 +1098,23 @@ async function handleSavePayment(data, res) {
     // Auto-create a Tenancy Tracker record the moment a rent/lease payment
     // is confirmed — previously this required a fully separate manual
     // "Add Tenancy" entry, duplicating data already on the payment itself.
-    // Buy transactions don't get a tenancy (no ongoing occupancy to track).
+    // Also handles auto-delisting the property from public/live listing
+    // once it's no longer available — see maybeDelistProperty() above for
+    // why that's multi-unit-aware rather than an unconditional flip.
     if (isNewTransition && status === 'confirmed' && propertyId) {
       try {
         const propR = await db.query(
-          "SELECT title, owner, COALESCE(listing_type,type,'rent') as listing_type, COALESCE(lease_duration_years::text,'1') as lease_duration_years FROM properties WHERE id=$1",
+          "SELECT title, owner, COALESCE(listing_type,type,'rent') as listing_type, COALESCE(lease_duration_years::text,'1') as lease_duration_years, COALESCE(rent_category,'standard') as rent_category FROM properties WHERE id=$1",
           [propertyId]
         );
         const propRow = propR.rows[0];
         console.log('[save-payment] tenancy check ref=' + ref + ' propertyRow=' + JSON.stringify(propRow));
-        if (propRow && (propRow.listing_type === 'rent' || propRow.listing_type === 'lease')) {
+        // Shortlets are meant to be booked repeatedly — a single confirmed
+        // booking must never create a long-running tenancy or delist the
+        // property. That's handled entirely by the separate bookings-table
+        // sync above instead.
+        const isShortlet = propRow && propRow.listing_type === 'rent' && propRow.rent_category === 'shortlet';
+        if (propRow && !isShortlet && (propRow.listing_type === 'rent' || propRow.listing_type === 'lease')) {
           const startDate = start || new Date().toISOString().slice(0, 10);
           const years = propRow.listing_type === 'lease' ? (Number(propRow.lease_duration_years) || 1) : 1;
           const endDate = end || new Date(new Date(startDate).setFullYear(new Date(startDate).getFullYear() + years)).toISOString().slice(0, 10);
@@ -1100,8 +1134,19 @@ async function handleSavePayment(data, res) {
             notes: 'Auto-created from confirmed payment ' + ref
           });
           console.log('[save-payment] tenancy auto-created for ref=' + ref + ' as TEN-FROM-' + ref);
+          await maybeDelistProperty(propertyId, propRow.listing_type);
+        } else if (propRow && propRow.listing_type === 'buy') {
+          // Buy has no ongoing occupancy to track (no tenancy), but a sold
+          // unit still needs marking so it stops showing as vacant, and the
+          // whole property still needs the same all-units-taken check
+          // before coming down from public listing.
+          if (unitId) {
+            await db.query("UPDATE property_units SET status='occupied' WHERE id=$1", [unitId]);
+          }
+          await maybeDelistProperty(propertyId, propRow.listing_type);
+          console.log('[save-payment] buy sale processed for ref=' + ref + ' — unit/property availability updated');
         } else {
-          console.log('[save-payment] tenancy SKIPPED for ref=' + ref + ' — property not found or listing_type is neither rent nor lease (got: ' + (propRow ? propRow.listing_type : 'no property row') + ')');
+          console.log('[save-payment] tenancy/delist SKIPPED for ref=' + ref + ' — property not found, listing_type unrecognized, or shortlet (rent_category=' + (propRow ? propRow.rent_category : 'n/a') + ')');
         }
       } catch (te) {
         // Never let tenancy auto-creation break the payment confirmation
