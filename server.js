@@ -727,6 +727,136 @@ async function handleOwnerTenancies(ownerId, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// ── Favorites (save/heart a property) ────────────────────────────────────────
+async function ensureFavoritesTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS favorites (
+    user_id TEXT NOT NULL, property_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, property_id)
+  )`).catch(() => {});
+}
+
+async function handleGetFavorites(ownerId, res) {
+  try {
+    await ensureFavoritesTable();
+    const result = await db.query(`
+      SELECT p.id, p.title, p.owner, p.type, COALESCE(p.listing_type,p.type,'rent') as listing_type,
+        p.status, p.price, p.state, p.lga, p.address, p.img,
+        COALESCE(p.images,'[]'::jsonb) as images, p.nightly_rate, p.annual_rent,
+        f.created_at as favorited_at
+      FROM favorites f JOIN properties p ON p.id = f.property_id
+      WHERE f.user_id = $1 ORDER BY f.created_at DESC
+    `, [ownerId]);
+    json(res, 200, { success: true, favorites: result.rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleAddFavorite(ownerId, data, res) {
+  try {
+    await ensureFavoritesTable();
+    const propertyId = data && data.property_id;
+    if (!propertyId) return json(res, 400, { error: 'property_id required' });
+    await db.query(
+      'INSERT INTO favorites (user_id, property_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [ownerId, propertyId]
+    );
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleRemoveFavorite(ownerId, propertyId, res) {
+  try {
+    await ensureFavoritesTable();
+    await db.query('DELETE FROM favorites WHERE user_id=$1 AND property_id=$2', [ownerId, propertyId]);
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// ── Saved Searches (in-app matching for now; push alerts are a later phase) ──
+async function ensureSavedSearchesTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS saved_searches (
+    id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, label TEXT DEFAULT '',
+    filters JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`).catch(() => {});
+}
+
+async function handleGetSavedSearches(ownerId, res) {
+  try {
+    await ensureSavedSearchesTable();
+    const result = await db.query(
+      'SELECT id, label, filters, created_at FROM saved_searches WHERE user_id=$1 ORDER BY created_at DESC',
+      [ownerId]
+    );
+    json(res, 200, { success: true, searches: result.rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleAddSavedSearch(ownerId, data, res) {
+  try {
+    await ensureSavedSearchesTable();
+    const { label, filters } = data || {};
+    if (!filters || typeof filters !== 'object') return json(res, 400, { error: 'filters object required' });
+    const result = await db.query(
+      'INSERT INTO saved_searches (user_id, label, filters) VALUES ($1,$2,$3) RETURNING id',
+      [ownerId, label || '', JSON.stringify(filters)]
+    );
+    json(res, 200, { success: true, id: result.rows[0].id });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleRemoveSavedSearch(ownerId, searchId, res) {
+  try {
+    await ensureSavedSearchesTable();
+    await db.query('DELETE FROM saved_searches WHERE id=$1 AND user_id=$2', [searchId, ownerId]);
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// ── Ratings ───────────────────────────────────────────────────────────────
+// Default design (flagged for the person to redirect if they want something
+// different): rates the OWNER after a transaction, 1-5 stars + optional
+// comment, publicly visible (aggregated average + count) on their listings —
+// same pattern as Airbnb/Jumia reviews. One rating per (rater, owner, ref)
+// so the same completed transaction can't be rated twice.
+async function ensureRatingsTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS ratings (
+    id SERIAL PRIMARY KEY, rater_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+    ref TEXT, stars INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
+    comment TEXT DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(rater_id, owner_id, ref)
+  )`).catch(() => {});
+}
+
+async function handleAddRating(ownerId, data, res) {
+  try {
+    await ensureRatingsTable();
+    const { owner_id, ref, stars, comment } = data || {};
+    if (!owner_id) return json(res, 400, { error: 'owner_id required' });
+    const s = Number(stars);
+    if (!s || s < 1 || s > 5) return json(res, 400, { error: 'stars must be 1-5' });
+    await db.query(
+      `INSERT INTO ratings (rater_id, owner_id, ref, stars, comment) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (rater_id, owner_id, ref) DO UPDATE SET stars=$4, comment=$5`,
+      [ownerId, owner_id, ref || '', s, comment || '']
+    );
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleGetOwnerRatings(ownerId, res) {
+  try {
+    await ensureRatingsTable();
+    const result = await db.query(
+      `SELECT stars, comment, created_at FROM ratings WHERE owner_id=$1 ORDER BY created_at DESC`,
+      [ownerId]
+    );
+    const rows = result.rows;
+    const avg = rows.length ? rows.reduce((s,r) => s + r.stars, 0) / rows.length : 0;
+    json(res, 200, { success: true, average: Math.round(avg*10)/10, count: rows.length, ratings: rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 async function handleAdminUpdate(url, data, res) {
   const regMatch = url.match(/^\/admin\/registration\/([^/]+)$/);
   if (regMatch) {
@@ -2079,6 +2209,8 @@ const server = http.createServer((req, res) => {
     // Public — no auth required
     if (url === '/properties')               return handlePublicProperties(urlFull, res);
     if (url.match(/^\/properties\/([^/]+)\/availability$/)) return handleGetAvailability(url.split('/')[2], res);
+    const ownerRatingsMatch = url.match(/^\/owner\/([^/]+)\/ratings$/);
+    if (ownerRatingsMatch) return handleGetOwnerRatings(ownerRatingsMatch[1], res);
     if (url.match(/^\/properties\/([^/]+)$/)) return handlePublicPropertyById(url.split('/')[2], res);
     if (url === '/events')                   return handleSSE(req, res);
 
@@ -2114,6 +2246,8 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/properties')       return handleOwnerProperties(ownerId, urlFull, res);
       if (url === '/owner/enquiries')        return handleOwnerEnquiries(ownerId, res);
       if (url === '/owner/tenancies')        return handleOwnerTenancies(ownerId, res);
+      if (url === '/owner/favorites')        return handleGetFavorites(ownerId, res);
+      if (url === '/owner/saved-searches')   return handleGetSavedSearches(ownerId, res);
       const propDetailMatch = url.match(/^\/owner\/property\/([^/]+)\/detail$/);
       if (propDetailMatch) return handleOwnerPropertyDetail(ownerId, propDetailMatch[1], res);
       const unitMatch = url.match(/^\/owner\/property\/([^/]+)\/units$/);
@@ -2144,6 +2278,10 @@ const server = http.createServer((req, res) => {
       if (owPropMatch) return handleOwnerDeleteProperty(ownerId, owPropMatch[1], res);
       const owUnitMatch = url.match(/^\/owner\/property\/([^/]+)\/units\/(\d+)$/);
       if (owUnitMatch) return handleDeleteUnit(ownerId, owUnitMatch[1], owUnitMatch[2], res);
+      const owFavMatch = url.match(/^\/owner\/favorites\/([^/]+)$/);
+      if (owFavMatch) return handleRemoveFavorite(ownerId, owFavMatch[1], res);
+      const owSearchMatch = url.match(/^\/owner\/saved-searches\/(\d+)$/);
+      if (owSearchMatch) return handleRemoveSavedSearch(ownerId, owSearchMatch[1], res);
     }
     return json(res, 404, { error: 'Not found' });
   }
@@ -2179,6 +2317,9 @@ const server = http.createServer((req, res) => {
           if (!ownerId) return;
           if (url === '/owner/verify-identity') return handleOwnerVerifyIdentity(ownerId, data, res);
           if (url === '/owner/add-property')    return handleOwnerAddProperty(ownerId, data, res);
+          if (url === '/owner/favorites')        return handleAddFavorite(ownerId, data, res);
+          if (url === '/owner/saved-searches')   return handleAddSavedSearch(ownerId, data, res);
+          if (url === '/owner/ratings')          return handleAddRating(ownerId, data, res);
           const owPropMatch = url.match(/^\/owner\/property\/([^/]+)$/);
           if (owPropMatch) return handleOwnerUpdateProperty(ownerId, owPropMatch[1], data, res);
           const owUnitMatch = url.match(/^\/owner\/property\/([^/]+)\/units$/);
