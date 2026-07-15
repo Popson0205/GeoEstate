@@ -32,6 +32,12 @@ const db = new Pool({
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.SECRET_RESEND_API_KEY;
+// Firebase Cloud Messaging (push notifications). Not configured yet -- needs
+// a Firebase project's service account JSON pasted into this env var (as a
+// single-line JSON string, or base64-encoded). Every push call below no-ops
+// silently until this is set, same graceful-degradation pattern as the rest
+// of this file (e.g. RESEND_API_KEY for email).
+const FCM_SERVICE_ACCOUNT_RAW = process.env.SECRET_FCM_SERVICE_ACCOUNT || '';
 // ── Admin Auth Config ────────────────────────────────────────────────────────
 const ADMIN_EMAIL    = process.env.ADMIN_EMAIL;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
@@ -210,6 +216,98 @@ function sendEmail(to, subject, html) {
     });
     req.on('error', reject); req.write(body); req.end();
   });
+}
+
+// ── Push notifications (Firebase Cloud Messaging, HTTP v1 API) ──────────────
+function base64url(input) {
+  return Buffer.from(input).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+let _fcmAccount = null;
+function getFcmAccount() {
+  if (_fcmAccount) return _fcmAccount;
+  if (!FCM_SERVICE_ACCOUNT_RAW) return null;
+  try {
+    // Accept either raw JSON or base64-encoded JSON in the env var.
+    const raw = FCM_SERVICE_ACCOUNT_RAW.trim().startsWith('{')
+      ? FCM_SERVICE_ACCOUNT_RAW
+      : Buffer.from(FCM_SERVICE_ACCOUNT_RAW, 'base64').toString('utf8');
+    _fcmAccount = JSON.parse(raw);
+    return _fcmAccount;
+  } catch (e) { console.error('Invalid SECRET_FCM_SERVICE_ACCOUNT:', e.message); return null; }
+}
+
+let _fcmTokenCache = { token: null, expiresAt: 0 };
+async function getFcmAccessToken() {
+  const account = getFcmAccount();
+  if (!account) return null;
+  if (_fcmTokenCache.token && Date.now() < _fcmTokenCache.expiresAt - 60000) return _fcmTokenCache.token;
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claims = base64url(JSON.stringify({
+    iss: account.client_email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600, iat: now
+  }));
+  const signInput = header + '.' + claims;
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(signInput);
+  const signature = base64url(signer.sign(account.private_key));
+  const jwt = signInput + '.' + signature;
+
+  return new Promise((resolve) => {
+    const body = 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + encodeURIComponent(jwt);
+    const req = https.request({
+      hostname: 'oauth2.googleapis.com', path: '/token', method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) }
+    }, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => {
+        try {
+          const p = JSON.parse(d);
+          if (p.access_token) {
+            _fcmTokenCache = { token: p.access_token, expiresAt: Date.now() + (p.expires_in || 3600) * 1000 };
+            resolve(p.access_token);
+          } else { console.error('FCM token error:', d); resolve(null); }
+        } catch (e) { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null)); req.write(body); req.end();
+  });
+}
+
+// Silently no-ops if FCM isn't configured yet — same graceful-degradation
+// pattern as sendEmail. Never throws; callers don't need to wrap in try/catch.
+async function sendPushNotification(deviceToken, title, body, data) {
+  if (!deviceToken) return { skipped: true };
+  const account = getFcmAccount();
+  if (!account) return { skipped: true, reason: 'FCM not configured' };
+  try {
+    const accessToken = await getFcmAccessToken();
+    if (!accessToken) return { skipped: true, reason: 'Could not get FCM access token' };
+    const payload = JSON.stringify({
+      message: {
+        token: deviceToken,
+        notification: { title, body },
+        data: data || {},
+        android: { priority: 'high' }
+      }
+    });
+    return await new Promise((resolve) => {
+      const req = https.request({
+        hostname: 'fcm.googleapis.com',
+        path: '/v1/projects/' + account.project_id + '/messages:send',
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
+      }, res => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => { resolve({ ok: res.statusCode === 200, status: res.statusCode, body: d }); });
+      });
+      req.on('error', (e) => resolve({ ok: false, error: e.message })); req.write(payload); req.end();
+    });
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 function otpEmail(code, name, purpose) {
@@ -728,6 +826,104 @@ async function handleOwnerTenancies(ownerId, res) {
 }
 
 // ── Favorites (save/heart a property) ────────────────────────────────────────
+// ── Push token registration ───────────────────────────────────────────────
+async function handleRegisterPushToken(ownerId, data, res) {
+  try {
+    const token = data && data.push_token;
+    if (!token) return json(res, 400, { error: 'push_token required' });
+    await db.query(`ALTER TABLE registrations ADD COLUMN IF NOT EXISTS push_token TEXT`).catch(() => {});
+    await db.query('UPDATE registrations SET push_token=$1, updated_at=NOW() WHERE id=$2', [token, ownerId]);
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function getPushToken(userId) {
+  try {
+    const r = await db.query('SELECT push_token FROM registrations WHERE id=$1', [userId]);
+    return r.rows[0]?.push_token || null;
+  } catch(e) { return null; }
+}
+
+// ── In-app chat (polling-based -- matches the rest of this app's pattern of
+// 30s background refresh rather than websockets) ────────────────────────────
+async function ensureMessagesTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS messages (
+    id SERIAL PRIMARY KEY,
+    property_id TEXT, sender_id TEXT NOT NULL, recipient_id TEXT NOT NULL,
+    sender_name TEXT DEFAULT '', body TEXT NOT NULL,
+    read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`).catch(() => {});
+}
+
+// A "conversation" is just the (other_user, property) pair a message thread
+// belongs to -- there's no separate conversations table, it's derived.
+async function handleGetConversations(userId, res) {
+  try {
+    await ensureMessagesTable();
+    const r = await db.query(`
+      SELECT DISTINCT ON (other_id, property_id) *
+      FROM (
+        SELECT
+          CASE WHEN sender_id=$1 THEN recipient_id ELSE sender_id END as other_id,
+          property_id, body, sender_id, created_at, read_at,
+          CASE WHEN recipient_id=$1 AND read_at IS NULL THEN 1 ELSE 0 END as unread
+        FROM messages WHERE sender_id=$1 OR recipient_id=$1
+      ) t
+      ORDER BY other_id, property_id, created_at DESC
+    `, [userId]);
+    // Enrich with the other party's name and the property title
+    const rows = await Promise.all(r.rows.map(async (row) => {
+      const [nameR, propR] = await Promise.all([
+        db.query('SELECT fname, lname FROM registrations WHERE id=$1', [row.other_id]),
+        row.property_id ? db.query('SELECT title FROM properties WHERE id=$1', [row.property_id]) : Promise.resolve({ rows: [] })
+      ]);
+      const n = nameR.rows[0];
+      return {
+        other_id: row.other_id,
+        other_name: n ? (n.fname + ' ' + n.lname).trim() : 'User',
+        property_id: row.property_id,
+        property_title: propR.rows[0]?.title || '',
+        last_message: row.body, last_at: row.created_at,
+        unread: !!row.unread
+      };
+    }));
+    rows.sort((a, b) => new Date(b.last_at) - new Date(a.last_at));
+    json(res, 200, { success: true, conversations: rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleGetThread(userId, otherId, propertyId, res) {
+  try {
+    await ensureMessagesTable();
+    const r = await db.query(`
+      SELECT * FROM messages
+      WHERE ((sender_id=$1 AND recipient_id=$2) OR (sender_id=$2 AND recipient_id=$1))
+        AND (property_id=$3 OR ($3='' AND property_id IS NULL))
+      ORDER BY created_at ASC
+    `, [userId, otherId, propertyId || '']);
+    // Mark incoming messages as read
+    await db.query(`UPDATE messages SET read_at=NOW() WHERE sender_id=$1 AND recipient_id=$2 AND read_at IS NULL AND (property_id=$3 OR ($3='' AND property_id IS NULL))`, [otherId, userId, propertyId || '']);
+    json(res, 200, { success: true, messages: r.rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleSendMessage(senderId, data, res) {
+  try {
+    await ensureMessagesTable();
+    const { recipient_id, property_id, body, sender_name } = data || {};
+    if (!recipient_id || !body || !body.trim()) return json(res, 400, { error: 'recipient_id and body required' });
+    const r = await db.query(
+      'INSERT INTO messages (property_id, sender_id, recipient_id, sender_name, body) VALUES ($1,$2,$3,$4,$5) RETURNING id, created_at',
+      [property_id || null, senderId, recipient_id, sender_name || '', body.trim()]
+    );
+    json(res, 200, { success: true, id: r.rows[0].id, created_at: r.rows[0].created_at });
+    // Push notification, best-effort, after responding to the sender
+    getPushToken(recipient_id).then(token => {
+      if (token) sendPushNotification(token, sender_name || 'New message', body.trim().slice(0, 100), { type: 'chat', sender_id: senderId, property_id: property_id || '' }).catch(() => {});
+    }).catch(() => {});
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 async function ensureFavoritesTable() {
   await db.query(`CREATE TABLE IF NOT EXISTS favorites (
     user_id TEXT NOT NULL, property_id TEXT NOT NULL,
@@ -1233,11 +1429,16 @@ async function handleSavePayment(data, res) {
     if (isNewTransition && (status === 'confirmed' || status === 'released')) {
       const p = { ref, prop, buyer, owner, amount, fee, owner_amt: ownerAmt };
       const ownerEmail = await getPropertyOwnerEmail(propertyId);
+      const propOwnerId = propertyId ? (await db.query('SELECT owner_id FROM properties WHERE id=$1', [propertyId])).rows[0]?.owner_id : null;
+      const buyerUserId = buyerEmail ? (await db.query('SELECT id FROM registrations WHERE email=$1', [buyerEmail])).rows[0]?.id : null;
       if (status === 'confirmed') {
         if (ownerEmail) sendEmail(ownerEmail, '✅ Payment Confirmed — ' + prop, paymentConfirmedEmail(p, true)).catch(e => console.warn('Owner confirm email failed:', e.message));
         if (buyerEmail) sendEmail(buyerEmail, '✅ Your Payment Has Been Confirmed', paymentConfirmedEmail(p, false)).catch(e => console.warn('Buyer confirm email failed:', e.message));
+        if (propOwnerId) getPushToken(propOwnerId).then(t => t && sendPushNotification(t, '✅ Payment Confirmed', prop + ' — handover can proceed', { type: 'payment_confirmed', ref })).catch(()=>{});
+        if (buyerUserId) getPushToken(buyerUserId).then(t => t && sendPushNotification(t, '✅ Payment Confirmed', 'Your payment for ' + prop + ' has been confirmed', { type: 'payment_confirmed', ref })).catch(()=>{});
       } else if (status === 'released') {
         if (ownerEmail) sendEmail(ownerEmail, '💸 Funds Released — ' + prop, paymentReleasedEmail(p)).catch(e => console.warn('Owner release email failed:', e.message));
+        if (propOwnerId) getPushToken(propOwnerId).then(t => t && sendPushNotification(t, '💸 Funds Released', 'Your payout for ' + prop + ' has been sent', { type: 'payment_released', ref })).catch(()=>{});
       }
     }
 
@@ -2248,6 +2449,11 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/tenancies')        return handleOwnerTenancies(ownerId, res);
       if (url === '/owner/favorites')        return handleGetFavorites(ownerId, res);
       if (url === '/owner/saved-searches')   return handleGetSavedSearches(ownerId, res);
+      if (url === '/owner/conversations')    return handleGetConversations(ownerId, res);
+      if (url.startsWith('/owner/messages')) {
+        const qp = new URL('http://x' + urlFull).searchParams;
+        return handleGetThread(ownerId, qp.get('with'), qp.get('property_id'), res);
+      }
       const propDetailMatch = url.match(/^\/owner\/property\/([^/]+)\/detail$/);
       if (propDetailMatch) return handleOwnerPropertyDetail(ownerId, propDetailMatch[1], res);
       const unitMatch = url.match(/^\/owner\/property\/([^/]+)\/units$/);
@@ -2320,6 +2526,8 @@ const server = http.createServer((req, res) => {
           if (url === '/owner/favorites')        return handleAddFavorite(ownerId, data, res);
           if (url === '/owner/saved-searches')   return handleAddSavedSearch(ownerId, data, res);
           if (url === '/owner/ratings')          return handleAddRating(ownerId, data, res);
+          if (url === '/owner/messages')         return handleSendMessage(ownerId, data, res);
+          if (url === '/owner/push-token')       return handleRegisterPushToken(ownerId, data, res);
           const owPropMatch = url.match(/^\/owner\/property\/([^/]+)$/);
           if (owPropMatch) return handleOwnerUpdateProperty(ownerId, owPropMatch[1], data, res);
           const owUnitMatch = url.match(/^\/owner\/property\/([^/]+)\/units$/);
