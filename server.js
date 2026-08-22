@@ -1057,6 +1057,35 @@ async function handleRemoveSavedSearch(ownerId, searchId, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// Notifies every saved-search owner whose filters match a listing that just
+// went live for the first time. Only matches on type/state (see the caller
+// in handleAdminUpdate for why filters.q — free text — isn't used here).
+// Deduped per user in case someone has multiple searches that all match the
+// same property, and never notifies the property's own owner about their
+// own listing.
+async function notifySavedSearchMatches(propertyId) {
+  await ensureSavedSearchesTable();
+  const propR = await db.query(
+    "SELECT title, owner_id, COALESCE(listing_type,type,'rent') as listing_type, state FROM properties WHERE id=$1",
+    [propertyId]
+  );
+  const prop = propR.rows[0];
+  if (!prop) return;
+  const searches = await db.query('SELECT user_id, filters FROM saved_searches');
+  const matchedUserIds = new Set();
+  for (const s of searches.rows) {
+    let filters = s.filters;
+    if (typeof filters === 'string') { try { filters = JSON.parse(filters); } catch (e) { filters = {}; } }
+    filters = filters || {};
+    const typeMatches = !filters.type || filters.type === 'all' || filters.type === prop.listing_type;
+    const stateMatches = !filters.state || filters.state === prop.state;
+    if (typeMatches && stateMatches && s.user_id !== prop.owner_id) matchedUserIds.add(s.user_id);
+  }
+  for (const userId of matchedUserIds) {
+    createNotification(userId, 'saved_search_match', '🔔 New Listing Matches Your Search', prop.title, { property_id: propertyId }).catch(() => {});
+  }
+}
+
 // ── Ratings ───────────────────────────────────────────────────────────────
 // Default design (flagged for the person to redirect if they want something
 // different): rates the OWNER after a transaction, 1-5 stars + optional
@@ -1135,6 +1164,8 @@ async function handleAdminUpdate(url, data, res) {
   if (propMatch) {
     const id = propMatch[1];
     try {
+      const before = await db.query("SELECT status FROM properties WHERE id=$1", [id]);
+      const wasLive = before.rows[0]?.status === 'live';
       const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo'];
       const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
       if (!fields.length) return json(res, 400, { error: 'No valid fields' });
@@ -1143,6 +1174,16 @@ async function handleAdminUpdate(url, data, res) {
       await logActivity('Property updated: ' + id);
       broadcast('property_updated', { id });
       json(res, 200, { success: true });
+
+      // Notify saved-search owners the moment a listing genuinely goes live
+      // for the first time (not on every subsequent edit to an already-live
+      // listing). Only matches on type/state — filters.q (free-text) is
+      // deliberately not used for matching here, since substring-matching a
+      // search query against a title is unreliable and this is meant as a
+      // helpful nudge, not a precise search engine.
+      if (data.status === 'live' && !wasLive) {
+        notifySavedSearchMatches(id).catch(e => console.error('notifySavedSearchMatches failed:', e.message));
+      }
     } catch(e) { json(res, 500, { error: e.message }); }
     return;
   }
@@ -1167,6 +1208,12 @@ async function handleAdminUpdate(url, data, res) {
     const id = enqMatch[1];
     const { status, notes, assigned_to } = data;
     try {
+      // Fetch the row first so we can tell whether this is a genuine
+      // transition into 'contacted' (only notify once, not on every
+      // subsequent notes/assigned_to edit) and so we have the enquirer's
+      // email + property title on hand afterward.
+      const before = await db.query('SELECT status, email, property_title FROM enquiries WHERE id=$1', [id]);
+      const prevStatus = before.rows[0]?.status;
       await db.query(
         'UPDATE enquiries SET status=COALESCE($1,status), notes=COALESCE($2,notes), assigned_to=COALESCE($3,assigned_to) WHERE id=$4',
         [status||null, notes||null, assigned_to||null, id]
@@ -1174,6 +1221,17 @@ async function handleAdminUpdate(url, data, res) {
       await logActivity('Enquiry ' + id + ' updated → ' + (status||'no status change'));
       broadcast('enquiry_updated', { id, status });
       json(res, 200, { success: true });
+
+      // Enquiries aren't tied to a registered account (name/email/phone are
+      // free-text — someone can enquire without ever signing up), so this
+      // can only notify if the enquirer's email happens to match one.
+      if (status === 'contacted' && status !== prevStatus && before.rows[0]?.email) {
+        const propertyTitle = before.rows[0].property_title || 'your enquiry';
+        db.query('SELECT id FROM registrations WHERE email=$1', [before.rows[0].email]).then(r => {
+          const enquirerId = r.rows[0]?.id;
+          if (enquirerId) createNotification(enquirerId, 'enquiry_replied', '📬 Enquiry Update', 'Our team has followed up on your enquiry about ' + propertyTitle, { enquiry_id: id }).catch(() => {});
+        }).catch(() => {});
+      }
     } catch(e) { json(res, 500, { error: e.message }); }
     return;
   }
