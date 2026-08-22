@@ -623,7 +623,10 @@ async function handlePublicProperties(urlFull, res) {
     const state  = params.get('state');
     const search = params.get('q');
 
-    let query = "SELECT id, title, owner, owner_id, type, COALESCE(listing_type, type, 'rent') as listing_type, status, price, state, lga, address, img, created_at FROM properties WHERE status='live'";
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_verified BOOLEAN DEFAULT FALSE`).catch(() => {});
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_date DATE`).catch(() => {});
+
+    let query = "SELECT id, title, owner, owner_id, type, COALESCE(listing_type, type, 'rent') as listing_type, status, price, state, lga, address, img, created_at, COALESCE(site_visit_verified,false) as site_visit_verified, (SELECT is_verified FROM registrations WHERE id=properties.owner_id) as owner_verified FROM properties WHERE status='live'";
     const args = [];
 
     if (typeFilter) {
@@ -659,10 +662,13 @@ async function handlePublicProperties(urlFull, res) {
 
 async function handlePublicPropertyById(id, res) {
   try {
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_verified BOOLEAN DEFAULT FALSE`).catch(() => {});
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_date DATE`).catch(() => {});
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_notes TEXT DEFAULT ''`).catch(() => {});
     let prop;
     try {
       const r = await db.query(
-        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(annual_rent,NULL) as annual_rent,COALESCE(nightly_rate,NULL) as nightly_rate,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,video_url,COALESCE(docs,'[]'::jsonb) as docs,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at FROM properties WHERE id=$1",
+        "SELECT id,title,owner,owner_id,type,COALESCE(listing_type,type,'rent') as listing_type,status,price,COALESCE(monthly_rent,NULL) as monthly_rent,COALESCE(annual_rent,NULL) as annual_rent,COALESCE(nightly_rate,NULL) as nightly_rate,COALESCE(sale_price,NULL) as sale_price,COALESCE(lease_price,NULL) as lease_price,state,lga,address,img,COALESCE(images,'[]'::jsonb) as images,video_url,COALESCE(docs,'[]'::jsonb) as docs,COALESCE(bedrooms,NULL) as bedrooms,COALESCE(bathrooms,NULL) as bathrooms,COALESCE(size_sqm,NULL) as size_sqm,COALESCE(description,'') as description,COALESCE(amenities,'[]'::jsonb) as amenities,notes,created_at,COALESCE(site_visit_verified,false) as site_visit_verified,site_visit_date,COALESCE(site_visit_notes,'') as site_visit_notes,(SELECT is_verified FROM registrations WHERE id=properties.owner_id) as owner_verified FROM properties WHERE id=$1",
         [id]
       );
       if (!r.rows.length) return json(res, 404, { error: 'Property not found' });
@@ -1166,7 +1172,12 @@ async function handleAdminUpdate(url, data, res) {
     try {
       const before = await db.query("SELECT status FROM properties WHERE id=$1", [id]);
       const wasLive = before.rows[0]?.status === 'live';
-      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo'];
+      if (data.site_visit_verified !== undefined || data.site_visit_date !== undefined || data.site_visit_notes !== undefined) {
+        await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_verified BOOLEAN DEFAULT FALSE`).catch(() => {});
+        await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_date DATE`).catch(() => {});
+        await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_notes TEXT DEFAULT ''`).catch(() => {});
+      }
+      const allowed = ['title','owner','listing_type','type','status','price','monthly_rent','sale_price','lease_price','state','lga','address','img','images','bedrooms','bathrooms','size_sqm','description','amenities','notes','lawyer_assigned','geo','site_visit_verified','site_visit_date','site_visit_notes'];
       const fields = Object.entries(data).filter(([k]) => allowed.includes(k));
       if (!fields.length) return json(res, 400, { error: 'No valid fields' });
       const sets = fields.map(([k],i) => `${k}=$${i+2}`).join(',');

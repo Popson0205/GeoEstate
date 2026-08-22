@@ -293,6 +293,13 @@ ALTER TABLE properties ADD COLUMN IF NOT EXISTS amenities      JSONB DEFAULT '[]
 ALTER TABLE property_units ADD COLUMN IF NOT EXISTS images      JSONB DEFAULT '[]';
 ALTER TABLE property_units ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
 
+-- Second verification tier, distinct from owner identity verification
+-- (registrations.is_verified). A physical site visit is a much stronger
+-- trust signal than an ID check alone, especially for higher-value sales.
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_verified BOOLEAN DEFAULT FALSE;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_date     DATE;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_notes    TEXT DEFAULT '';
+
 -- Lets a confirmed payment be traced back to the exact unit/property it was
 -- for, so confirming it can automatically create a Tenancy Tracker record
 -- (see handleSavePayment) instead of requiring a separate manual entry.
