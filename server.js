@@ -1372,6 +1372,84 @@ function paymentReleasedEmail(p) {
 </table></td></tr></table></body></html>`;
 }
 
+function tenancyReminderEmail(t, stage, forOwner) {
+  const stageCopy = {
+    two_month: {
+      heading: '📅 Tenancy Renewal — 2 Months Notice',
+      tenant: `Your ${t.type} agreement for <strong>${t.property}</strong> is due to end on <strong>${new Date(t.end_date).toLocaleDateString('en-NG',{day:'numeric',month:'long',year:'numeric'})}</strong>. Please confirm whether you'd like to renew, or give notice to vacate.`,
+      owner: `A tenancy on your property <strong>${t.property}</strong> is entering its 2-month renewal window (ends ${new Date(t.end_date).toLocaleDateString('en-NG',{day:'numeric',month:'long',year:'numeric'})}). The tenant has been notified to confirm renewal or give notice.`
+    },
+    two_week: {
+      heading: '⏰ Final Reminder — Tenancy Ends in 2 Weeks',
+      tenant: `This is a final reminder that your ${t.type} agreement for <strong>${t.property}</strong> ends on <strong>${new Date(t.end_date).toLocaleDateString('en-NG',{day:'numeric',month:'long',year:'numeric'})}</strong>. If no renewal payment is made, the packing-out process will begin on expiry.`,
+      owner: `A tenancy on <strong>${t.property}</strong> is 2 weeks from expiry with no renewal confirmed yet. If nothing changes, the packing-out process begins automatically on the end date.`
+    },
+    expiry: {
+      heading: '📦 Tenancy Ended — Packing-Out Period Begins',
+      tenant: `Your ${t.type} agreement for <strong>${t.property}</strong> ended on <strong>${new Date(t.end_date).toLocaleDateString('en-NG',{day:'numeric',month:'long',year:'numeric'})}</strong>. As outlined in our policy, you have <strong>3 weeks</strong> from today to vacate the property unless a renewal has already been arranged.`,
+      owner: `A tenancy on <strong>${t.property}</strong> has reached its end date. The tenant has been notified of the standard 3-week packing-out period, per policy.`
+    }
+  };
+  const copy = stageCopy[stage];
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 20px"><tr><td align="center">
+<table width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08)">
+<tr><td style="background:linear-gradient(135deg,#0d3d22,#1a6b3c);padding:24px 32px">
+  <div style="color:#fff;font-size:18px;font-weight:800">${copy.heading}</div>
+  <div style="color:rgba(255,255,255,.65);font-size:13px;margin-top:4px">Reference ${t.ref}</div>
+</td></tr>
+<tr><td style="padding:32px">
+  <p style="color:#374151;font-size:14px;line-height:1.6">${forOwner ? copy.owner : copy.tenant}</p>
+  <table style="width:100%;font-size:14px;border-collapse:collapse;background:#f0fdf4;border-radius:8px;padding:12px;margin-top:8px">
+    <tr><td style="padding:6px 12px;color:#6b7280">Property</td><td style="padding:6px 12px;font-weight:700">${t.property}</td></tr>
+    <tr><td style="padding:6px 12px;color:#6b7280">${forOwner ? 'Tenant' : 'Owner'}</td><td style="padding:6px 12px">${forOwner ? t.tenant : t.owner}</td></tr>
+    <tr><td style="padding:6px 12px;color:#6b7280">End Date</td><td style="padding:6px 12px;font-weight:700">${new Date(t.end_date).toLocaleDateString('en-NG',{day:'numeric',month:'long',year:'numeric'})}</td></tr>
+  </table>
+</td></tr>
+</table></td></tr></table></body></html>`;
+}
+
+// ── Scheduled tenancy renewal/packing-out reminders ──────────────────────
+// Implements the exact policy already described (but never actually
+// automated) in the admin Tenancy Tracker UI: notify at 2 months before
+// expiry, a final reminder at 2 weeks, and an expiry notice starting the
+// 3-week packing-out period. Each stage only ever fires once per tenancy,
+// tracked via the reminder_*_sent columns.
+async function checkTenancyReminders() {
+  try {
+    const r = await db.query(`
+      SELECT t.*, (SELECT email FROM registrations WHERE id = t.tenant_id) as tenant_email,
+        (SELECT email FROM registrations WHERE id = p.owner_id) as owner_email
+      FROM tenancies t
+      LEFT JOIN properties p ON p.id = t.property_id
+      WHERE t.status = 'active' AND t.end_date IS NOT NULL
+    `);
+    const now = new Date();
+    for (const t of r.rows) {
+      const daysLeft = Math.ceil((new Date(t.end_date) - now) / (1000 * 60 * 60 * 24));
+      let stage = null, newStatus = null;
+      if (daysLeft <= 0 && !t.reminder_expiry_sent) { stage = 'expiry'; newStatus = 'packing-out'; }
+      else if (daysLeft <= 14 && daysLeft > 0 && !t.reminder_2wk_sent) { stage = 'two_week'; }
+      else if (daysLeft <= 60 && daysLeft > 14 && !t.reminder_2mo_sent) { stage = 'two_month'; }
+      if (!stage) continue;
+
+      if (t.tenant_email) sendEmail(t.tenant_email, 'GeoEstate — ' + t.property, tenancyReminderEmail(t, stage, false)).catch(e => console.warn('Tenant reminder email failed:', e.message));
+      if (t.owner_email) sendEmail(t.owner_email, 'GeoEstate — ' + t.property, tenancyReminderEmail(t, stage, true)).catch(e => console.warn('Owner reminder email failed:', e.message));
+
+      const col = stage === 'expiry' ? 'reminder_expiry_sent' : stage === 'two_week' ? 'reminder_2wk_sent' : 'reminder_2mo_sent';
+      await db.query(
+        `UPDATE tenancies SET ${col}=TRUE${newStatus ? ", status=$2, packing_out_date=COALESCE(packing_out_date, CURRENT_DATE)" : ""} WHERE id=$1`,
+        newStatus ? [t.id, newStatus] : [t.id]
+      );
+      await logActivity('Tenancy reminder (' + stage + ') sent for ' + t.property + ' — ' + t.ref);
+    }
+  } catch (e) {
+    console.error('checkTenancyReminders failed:', e.message);
+  }
+}
+
+
 async function getPropertyOwnerEmail(propertyId) {
   if (!propertyId) return null;
   try {
@@ -2701,3 +2779,11 @@ async function handleAdminLogout(req, res) {
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log('✅ GeoEstate API v2.0 running on port ' + PORT));
+
+// Tenancy renewal/packing-out reminders — runs once shortly after boot (so a
+// deploy/restart doesn't mean waiting a full day for the first check), then
+// every 12 hours after that. A plain setInterval is fine here since Railway
+// keeps this process running continuously — no external cron infrastructure
+// needed.
+setTimeout(() => { checkTenancyReminders().catch(e => console.error('Initial tenancy reminder check failed:', e.message)); }, 30000);
+setInterval(() => { checkTenancyReminders().catch(e => console.error('Scheduled tenancy reminder check failed:', e.message)); }, 12 * 60 * 60 * 1000);

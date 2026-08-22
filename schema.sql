@@ -290,6 +290,14 @@ ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS property_id TEXT;
 ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS unit_id     INTEGER;
 ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS tenant_id   TEXT;
 
+-- Tracks whether each stage of the renewal/packing-out policy reminder
+-- (2 months before expiry, 2 weeks before, and on expiry itself) has
+-- already been emailed, so the scheduled reminder check never sends the
+-- same stage twice for the same tenancy.
+ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS reminder_2mo_sent     BOOLEAN DEFAULT FALSE;
+ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS reminder_2wk_sent     BOOLEAN DEFAULT FALSE;
+ALTER TABLE tenancies ADD COLUMN IF NOT EXISTS reminder_expiry_sent  BOOLEAN DEFAULT FALSE;
+
 -- Payment → tenancy link
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS tenancy_id INTEGER;
 
