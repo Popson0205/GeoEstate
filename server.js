@@ -727,6 +727,9 @@ async function handleGetRegistrations(url, res) {
 
 async function handleGetProperties(res) {
   try {
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_verified BOOLEAN DEFAULT FALSE`).catch(() => {});
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_date DATE`).catch(() => {});
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_notes TEXT DEFAULT ''`).catch(() => {});
     // Use safe column list that works with both old and new schema
     const result = await db.query(`
       SELECT id, title, owner, owner_id, type,
@@ -749,7 +752,9 @@ async function handleGetProperties(res) {
         COALESCE(size_sqm, NULL) as size_sqm,
         COALESCE(description, '') as description,
         COALESCE(amenities, '[]'::jsonb) as amenities,
-        notes, submitted, created_at, updated_at
+        notes, submitted, created_at, updated_at,
+        COALESCE(site_visit_verified, false) as site_visit_verified,
+        site_visit_date, COALESCE(site_visit_notes, '') as site_visit_notes
       FROM properties ORDER BY created_at DESC
     `);
     json(res, 200, { success: true, count: result.rows.length, properties: result.rows });
