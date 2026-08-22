@@ -217,6 +217,23 @@ CREATE TABLE IF NOT EXISTS disputes (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Real in-app notification center — the "Notifications" tab on both
+-- platforms previously read from a localStorage key nothing ever wrote to.
+-- Also doubles as the push-notification trigger point (see
+-- createNotification() in server.js), so every notification type only
+-- needs to be wired up once to cover both in-app and push delivery.
+CREATE TABLE IF NOT EXISTS notifications (
+  id          SERIAL PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  type        TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  body        TEXT DEFAULT '',
+  data        JSONB DEFAULT '{}',
+  read_at     TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS activity_log (
   id              SERIAL PRIMARY KEY,
   message         TEXT NOT NULL,

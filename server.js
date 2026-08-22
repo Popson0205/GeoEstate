@@ -844,6 +844,55 @@ async function getPushToken(userId) {
   } catch(e) { return null; }
 }
 
+// ── In-app notification center ───────────────────────────────────────────
+// A single place that both stores a real, viewable notification (for the
+// previously-empty "Notifications" tab on both platforms) and fires the
+// matching push notification — every event type only needs one call here
+// to cover both delivery paths instead of wiring push separately everywhere.
+async function ensureNotificationsTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS notifications (
+    id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, type TEXT NOT NULL,
+    title TEXT NOT NULL, body TEXT DEFAULT '', data JSONB DEFAULT '{}',
+    read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`).catch(() => {});
+}
+
+async function createNotification(userId, type, title, body, data) {
+  if (!userId) return;
+  try {
+    await ensureNotificationsTable();
+    await db.query(
+      'INSERT INTO notifications (user_id, type, title, body, data) VALUES ($1,$2,$3,$4,$5)',
+      [userId, type, title, body || '', JSON.stringify(data || {})]
+    );
+    broadcast('notification_new', { user_id: userId });
+    const token = await getPushToken(userId);
+    if (token) sendPushNotification(token, title, body || '', Object.assign({ type }, data || {})).catch(() => {});
+  } catch (e) {
+    console.error('createNotification failed for user ' + userId + ':', e.message);
+  }
+}
+
+async function handleGetNotifications(userId, res) {
+  try {
+    await ensureNotificationsTable();
+    const r = await db.query('SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [userId]);
+    json(res, 200, { success: true, notifications: r.rows });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleMarkNotificationsRead(userId, data, res) {
+  try {
+    await ensureNotificationsTable();
+    if (data && data.id) {
+      await db.query('UPDATE notifications SET read_at=NOW() WHERE id=$1 AND user_id=$2', [data.id, userId]);
+    } else {
+      await db.query('UPDATE notifications SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL', [userId]);
+    }
+    json(res, 200, { success: true });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
 // ── In-app chat (polling-based -- matches the rest of this app's pattern of
 // 30s background refresh rather than websockets) ────────────────────────────
 async function ensureMessagesTable() {
@@ -917,10 +966,9 @@ async function handleSendMessage(senderId, data, res) {
       [property_id || null, senderId, recipient_id, sender_name || '', body.trim()]
     );
     json(res, 200, { success: true, id: r.rows[0].id, created_at: r.rows[0].created_at });
-    // Push notification, best-effort, after responding to the sender
-    getPushToken(recipient_id).then(token => {
-      if (token) sendPushNotification(token, sender_name || 'New message', body.trim().slice(0, 100), { type: 'chat', sender_id: senderId, property_id: property_id || '' }).catch(() => {});
-    }).catch(() => {});
+    // Best-effort, after responding to the sender — stores a real
+    // notification (for the Notifications tab) and pushes, in one call.
+    createNotification(recipient_id, 'chat', sender_name || 'New message', body.trim().slice(0, 100), { sender_id: senderId, property_id: property_id || '' }).catch(() => {});
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
@@ -1419,13 +1467,19 @@ function tenancyReminderEmail(t, stage, forOwner) {
 async function checkTenancyReminders() {
   try {
     const r = await db.query(`
-      SELECT t.*, (SELECT email FROM registrations WHERE id = t.tenant_id) as tenant_email,
+      SELECT t.*, p.owner_id as prop_owner_id,
+        (SELECT email FROM registrations WHERE id = t.tenant_id) as tenant_email,
         (SELECT email FROM registrations WHERE id = p.owner_id) as owner_email
       FROM tenancies t
       LEFT JOIN properties p ON p.id = t.property_id
       WHERE t.status = 'active' AND t.end_date IS NOT NULL
     `);
     const now = new Date();
+    const stageTitle = {
+      two_month: '📅 Renewal — 2 Months Notice',
+      two_week: '⏰ Final Reminder — 2 Weeks Left',
+      expiry: '📦 Tenancy Ended — Packing-Out Begins'
+    };
     for (const t of r.rows) {
       const daysLeft = Math.ceil((new Date(t.end_date) - now) / (1000 * 60 * 60 * 24));
       let stage = null, newStatus = null;
@@ -1436,6 +1490,8 @@ async function checkTenancyReminders() {
 
       if (t.tenant_email) sendEmail(t.tenant_email, 'GeoEstate — ' + t.property, tenancyReminderEmail(t, stage, false)).catch(e => console.warn('Tenant reminder email failed:', e.message));
       if (t.owner_email) sendEmail(t.owner_email, 'GeoEstate — ' + t.property, tenancyReminderEmail(t, stage, true)).catch(e => console.warn('Owner reminder email failed:', e.message));
+      if (t.tenant_id) createNotification(t.tenant_id, 'tenancy_reminder', stageTitle[stage], t.property, { ref: t.ref, stage }).catch(() => {});
+      if (t.prop_owner_id) createNotification(t.prop_owner_id, 'tenancy_reminder', stageTitle[stage], t.property, { ref: t.ref, stage }).catch(() => {});
 
       const col = stage === 'expiry' ? 'reminder_expiry_sent' : stage === 'two_week' ? 'reminder_2wk_sent' : 'reminder_2mo_sent';
       await db.query(
@@ -1512,11 +1568,11 @@ async function handleSavePayment(data, res) {
       if (status === 'confirmed') {
         if (ownerEmail) sendEmail(ownerEmail, '✅ Payment Confirmed — ' + prop, paymentConfirmedEmail(p, true)).catch(e => console.warn('Owner confirm email failed:', e.message));
         if (buyerEmail) sendEmail(buyerEmail, '✅ Your Payment Has Been Confirmed', paymentConfirmedEmail(p, false)).catch(e => console.warn('Buyer confirm email failed:', e.message));
-        if (propOwnerId) getPushToken(propOwnerId).then(t => t && sendPushNotification(t, '✅ Payment Confirmed', prop + ' — handover can proceed', { type: 'payment_confirmed', ref })).catch(()=>{});
-        if (buyerUserId) getPushToken(buyerUserId).then(t => t && sendPushNotification(t, '✅ Payment Confirmed', 'Your payment for ' + prop + ' has been confirmed', { type: 'payment_confirmed', ref })).catch(()=>{});
+        if (propOwnerId) createNotification(propOwnerId, 'payment_confirmed', '✅ Payment Confirmed', prop + ' — handover can proceed', { ref }).catch(()=>{});
+        if (buyerUserId) createNotification(buyerUserId, 'payment_confirmed', '✅ Payment Confirmed', 'Your payment for ' + prop + ' has been confirmed', { ref }).catch(()=>{});
       } else if (status === 'released') {
         if (ownerEmail) sendEmail(ownerEmail, '💸 Funds Released — ' + prop, paymentReleasedEmail(p)).catch(e => console.warn('Owner release email failed:', e.message));
-        if (propOwnerId) getPushToken(propOwnerId).then(t => t && sendPushNotification(t, '💸 Funds Released', 'Your payout for ' + prop + ' has been sent', { type: 'payment_released', ref })).catch(()=>{});
+        if (propOwnerId) createNotification(propOwnerId, 'payment_released', '💸 Funds Released', 'Your payout for ' + prop + ' has been sent', { ref }).catch(()=>{});
       }
     }
 
@@ -2525,6 +2581,7 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/properties')       return handleOwnerProperties(ownerId, urlFull, res);
       if (url === '/owner/enquiries')        return handleOwnerEnquiries(ownerId, res);
       if (url === '/owner/tenancies')        return handleOwnerTenancies(ownerId, res);
+      if (url === '/owner/notifications')    return handleGetNotifications(ownerId, res);
       if (url === '/owner/favorites')        return handleGetFavorites(ownerId, res);
       if (url === '/owner/saved-searches')   return handleGetSavedSearches(ownerId, res);
       if (url === '/owner/conversations')    return handleGetConversations(ownerId, res);
@@ -2603,6 +2660,7 @@ const server = http.createServer((req, res) => {
           if (url === '/owner/add-property')    return handleOwnerAddProperty(ownerId, data, res);
           if (url === '/owner/favorites')        return handleAddFavorite(ownerId, data, res);
           if (url === '/owner/saved-searches')   return handleAddSavedSearch(ownerId, data, res);
+          if (url === '/owner/notifications/mark-read') return handleMarkNotificationsRead(ownerId, data, res);
           if (url === '/owner/ratings')          return handleAddRating(ownerId, data, res);
           if (url === '/owner/messages')         return handleSendMessage(ownerId, data, res);
           if (url === '/owner/push-token')       return handleRegisterPushToken(ownerId, data, res);
