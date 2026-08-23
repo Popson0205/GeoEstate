@@ -306,6 +306,24 @@ ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_notes    TEXT DEFAULT
 -- actually wants, not a detailed audit trail.
 ALTER TABLE properties ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0;
 
+-- Digital signature capture for tenancy agreements. This is a typed-name
+-- signature + timestamp, a widely-used and generally accepted e-signature
+-- pattern (similar to what many document-signing platforms use), NOT a
+-- full certificate-based e-signature system — legal validity of a typed
+-- signature varies by jurisdiction and use case, so this doesn't claim to
+-- replace professional legal counsel for high-stakes agreements. One
+-- agreement per tenancy.
+CREATE TABLE IF NOT EXISTS tenancy_agreements (
+  id                SERIAL PRIMARY KEY,
+  tenancy_id        INTEGER NOT NULL REFERENCES tenancies(id) ON DELETE CASCADE UNIQUE,
+  content           TEXT NOT NULL,
+  owner_signature   TEXT,
+  owner_signed_at   TIMESTAMPTZ,
+  tenant_signature  TEXT,
+  tenant_signed_at  TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Lets a confirmed payment be traced back to the exact unit/property it was
 -- for, so confirming it can automatically create a Tenancy Tracker record
 -- (see handleSavePayment) instead of requiring a separate manual entry.

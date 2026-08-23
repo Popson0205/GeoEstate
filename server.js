@@ -850,6 +850,114 @@ async function handleOwnerTenancies(ownerId, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// ── E-signature tenancy agreements ───────────────────────────────────────
+// A typed-name signature + timestamp, a widely-used and generally accepted
+// e-signature pattern — not a full certificate-based e-signature system.
+// Legal validity of a typed signature varies by jurisdiction and use case,
+// so this doesn't claim to replace professional legal counsel for
+// high-stakes agreements; the generated document says as much too.
+async function ensureAgreementsTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS tenancy_agreements (
+    id SERIAL PRIMARY KEY, tenancy_id INTEGER NOT NULL REFERENCES tenancies(id) ON DELETE CASCADE UNIQUE,
+    content TEXT NOT NULL, owner_signature TEXT, owner_signed_at TIMESTAMPTZ,
+    tenant_signature TEXT, tenant_signed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`).catch(() => {});
+}
+
+// Determines whether the given user is the owner or the tenant on a
+// tenancy (or neither, in which case they have no business seeing/signing
+// it) — a tenancy can legitimately have no linked tenant_id at all (an
+// auto-created tenancy where the payer's email didn't match any
+// registered account), in which case only the owner can view/sign here.
+async function getTenancyForUser(userId, tenancyId) {
+  const r = await db.query(`
+    SELECT t.*, p.owner_id as property_owner_id, p.title as property_title
+    FROM tenancies t
+    LEFT JOIN properties p ON p.id = t.property_id
+    WHERE t.id = $1
+  `, [tenancyId]);
+  if (!r.rows.length) return null;
+  const t = r.rows[0];
+  let role = null;
+  if (t.property_owner_id && t.property_owner_id === userId) role = 'owner';
+  else if (t.tenant_id && t.tenant_id === userId) role = 'tenant';
+  return { tenancy: t, role };
+}
+
+function generateAgreementText(t) {
+  const fmt = (d) => d ? new Date(d).toLocaleDateString('en-NG', { day: 'numeric', month: 'long', year: 'numeric' }) : '—';
+  return `TENANCY AGREEMENT
+
+LANDLORD/OWNER: ${t.owner || '—'}
+TENANT: ${t.tenant || '—'}
+
+PROPERTY: ${t.property || t.property_title || '—'}
+TENANCY TYPE: ${(t.type || 'rent').toUpperCase()}
+COMMENCEMENT DATE: ${fmt(t.start_date)}
+EXPIRY DATE: ${fmt(t.end_date)}
+AMOUNT: ₦${Number(t.amount || 0).toLocaleString()}
+
+TERMS
+
+1. The Tenant agrees to pay the amount stated above for the tenancy period stated above.
+2. The Tenant shall maintain the property in good condition and report any damage promptly to the Owner.
+3. Renewal notice will be given at least 2 months before expiry, per GeoEstate's standard renewal policy.
+4. If the tenancy is not renewed by expiry, the Tenant shall vacate within 3 weeks — the standard packing-out period.
+5. Any disputes shall first be addressed through GeoEstate's dispute resolution process before any other action is taken.
+
+This agreement was generated via the GeoEstate platform and reflects the tenancy details recorded at the time of confirmation. It does not replace, and the parties are encouraged to seek, independent legal advice for their specific circumstances.
+
+By signing below, both parties acknowledge they have read and agree to the terms above.`;
+}
+
+async function handleGetTenancyAgreement(userId, tenancyId, res) {
+  try {
+    await ensureAgreementsTable();
+    const info = await getTenancyForUser(userId, tenancyId);
+    if (!info) return json(res, 404, { error: 'Tenancy not found' });
+    if (!info.role) return json(res, 403, { error: 'You are not a party to this tenancy' });
+    let agR = await db.query('SELECT * FROM tenancy_agreements WHERE tenancy_id=$1', [tenancyId]);
+    let agreement;
+    if (!agR.rows.length) {
+      const content = generateAgreementText(info.tenancy);
+      const ins = await db.query('INSERT INTO tenancy_agreements (tenancy_id, content) VALUES ($1,$2) RETURNING *', [tenancyId, content]);
+      agreement = ins.rows[0];
+    } else {
+      agreement = agR.rows[0];
+    }
+    json(res, 200, { success: true, agreement, role: info.role });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleSignTenancyAgreement(userId, tenancyId, data, res) {
+  const signature = (data.signature || '').toString().trim();
+  if (!signature) return json(res, 400, { error: 'Signature (typed full name) required' });
+  try {
+    await ensureAgreementsTable();
+    const info = await getTenancyForUser(userId, tenancyId);
+    if (!info) return json(res, 404, { error: 'Tenancy not found' });
+    if (!info.role) return json(res, 403, { error: 'You are not a party to this tenancy' });
+    const agR = await db.query('SELECT id FROM tenancy_agreements WHERE tenancy_id=$1', [tenancyId]);
+    if (!agR.rows.length) return json(res, 400, { error: 'Agreement not generated yet — view it first' });
+    const col = info.role === 'owner' ? 'owner_signature' : 'tenant_signature';
+    const dateCol = info.role === 'owner' ? 'owner_signed_at' : 'tenant_signed_at';
+    await db.query(`UPDATE tenancy_agreements SET ${col}=$1, ${dateCol}=NOW() WHERE tenancy_id=$2`, [signature, tenancyId]);
+    await logActivity('Tenancy agreement signed by ' + info.role + ' (' + signature + ') for tenancy ' + tenancyId);
+    const updated = await db.query('SELECT * FROM tenancy_agreements WHERE tenancy_id=$1', [tenancyId]);
+    const ag = updated.rows[0];
+    const t = info.tenancy;
+    if (ag.owner_signature && ag.tenant_signature) {
+      if (t.property_owner_id) createNotification(t.property_owner_id, 'agreement_signed', '✅ Agreement Fully Signed', t.property || '', { tenancy_id: tenancyId }).catch(() => {});
+      if (t.tenant_id) createNotification(t.tenant_id, 'agreement_signed', '✅ Agreement Fully Signed', t.property || '', { tenancy_id: tenancyId }).catch(() => {});
+    } else {
+      const otherUserId = info.role === 'owner' ? t.tenant_id : t.property_owner_id;
+      if (otherUserId) createNotification(otherUserId, 'agreement_pending', '📝 Agreement Awaiting Your Signature', t.property || '', { tenancy_id: tenancyId }).catch(() => {});
+    }
+    json(res, 200, { success: true, agreement: ag });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 // ── Favorites (save/heart a property) ────────────────────────────────────────
 // ── Push token registration ───────────────────────────────────────────────
 async function handleRegisterPushToken(ownerId, data, res) {
@@ -2737,6 +2845,8 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/enquiries')        return handleOwnerEnquiries(ownerId, res);
       if (url === '/owner/tenancies')        return handleOwnerTenancies(ownerId, res);
       if (url === '/owner/analytics')        return handleOwnerAnalytics(ownerId, res);
+      const agreementGetMatch = url.match(/^\/owner\/tenancy\/(\d+)\/agreement$/);
+      if (agreementGetMatch) return handleGetTenancyAgreement(ownerId, agreementGetMatch[1], res);
       if (url === '/owner/notifications')    return handleGetNotifications(ownerId, res);
       if (url === '/owner/favorites')        return handleGetFavorites(ownerId, res);
       if (url === '/owner/saved-searches')   return handleGetSavedSearches(ownerId, res);
@@ -2828,6 +2938,8 @@ const server = http.createServer((req, res) => {
           if (owUnitMatch) return handleAddUnit(ownerId, owUnitMatch[1], data, res);
           const owUnitBulkMatch = url.match(/^\/owner\/property\/([^/]+)\/units\/bulk$/);
           if (owUnitBulkMatch) return handleBulkAddUnits(ownerId, owUnitBulkMatch[1], data, res);
+          const agreementSignMatch = url.match(/^\/owner\/tenancy\/(\d+)\/agreement\/sign$/);
+          if (agreementSignMatch) return handleSignTenancyAgreement(ownerId, agreementSignMatch[1], data, res);
           const owUnitPatch = url.match(/^\/owner\/property\/([^/]+)\/units\/(\d+)$/);
           if (owUnitPatch) return handleUpdateUnit(ownerId, owUnitPatch[1], owUnitPatch[2], data, res);
           return json(res, 404, { error: 'Not found' });
