@@ -660,6 +660,20 @@ async function handlePublicProperties(urlFull, res) {
 }
 
 
+// Increments a property's view counter — called once per property per
+// browser session (deduped client-side via sessionStorage, not here) when
+// its detail page loads. Deliberately simple: a single incrementing
+// counter rather than a full events table with per-viewer rows, since
+// "roughly how many people looked at this listing" is what an owner
+// actually wants to see, not a detailed audit trail.
+async function handleRecordPropertyView(id, res) {
+  try {
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0`).catch(() => {});
+    await db.query('UPDATE properties SET view_count = COALESCE(view_count,0) + 1 WHERE id=$1', [id]);
+    json(res, 200, { success: true });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
 async function handlePublicPropertyById(id, res) {
   try {
     await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_verified BOOLEAN DEFAULT FALSE`).catch(() => {});
@@ -2067,6 +2081,34 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// Per-property analytics for the owner dashboard: view count (see
+// handleRecordPropertyView above), enquiry count, and a simple
+// enquiry-rate percentage. One row per property, most-viewed first.
+async function handleOwnerAnalytics(ownerId, res) {
+  try {
+    await db.query(`ALTER TABLE properties ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0`).catch(() => {});
+    const r = await db.query(`
+      SELECT p.id, p.title, p.status, COALESCE(p.listing_type, p.type, 'rent') as listing_type,
+        p.img, p.created_at, COALESCE(p.view_count, 0) as view_count,
+        (SELECT COUNT(*)::int FROM enquiries e WHERE e.property_id = p.id) as enquiry_count
+      FROM properties p
+      WHERE p.owner_id = $1
+      ORDER BY COALESCE(p.view_count, 0) DESC, p.created_at DESC
+    `, [ownerId]);
+    const rows = r.rows.map(row => ({
+      ...row,
+      enquiry_rate: row.view_count > 0 ? Math.round((row.enquiry_count / row.view_count) * 100) : 0,
+      days_live: Math.max(0, Math.floor((Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60 * 24)))
+    }));
+    const totals = {
+      total_views: rows.reduce((s, r) => s + r.view_count, 0),
+      total_enquiries: rows.reduce((s, r) => s + r.enquiry_count, 0),
+      total_properties: rows.length
+    };
+    json(res, 200, { success: true, properties: rows, totals });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
 async function handleOwnerProperties(ownerId, urlFull, res) {
   try {
     const params = new URL('http://x' + urlFull).searchParams;
@@ -2694,6 +2736,7 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/properties')       return handleOwnerProperties(ownerId, urlFull, res);
       if (url === '/owner/enquiries')        return handleOwnerEnquiries(ownerId, res);
       if (url === '/owner/tenancies')        return handleOwnerTenancies(ownerId, res);
+      if (url === '/owner/analytics')        return handleOwnerAnalytics(ownerId, res);
       if (url === '/owner/notifications')    return handleGetNotifications(ownerId, res);
       if (url === '/owner/favorites')        return handleGetFavorites(ownerId, res);
       if (url === '/owner/saved-searches')   return handleGetSavedSearches(ownerId, res);
@@ -2757,6 +2800,8 @@ const server = http.createServer((req, res) => {
         if (url === '/register')             return handleRegister(data, res);
         if (url === '/user/login')            return handleUserLogin(data, res);
         if (url === '/enquiry')              return handleEnquiry(data, res);
+        const viewMatch = url.match(/^\/properties\/([^/]+)\/view$/);
+        if (viewMatch) return handleRecordPropertyView(viewMatch[1], res);
         if (url === '/submit-payment')       return handleSubmitPayment(data, res);
         if (url === '/upload-sign')           return handleSupabaseUploadSign(data, res);
         if (url === '/submit-dispute')       return handleSubmitDispute(data, res);

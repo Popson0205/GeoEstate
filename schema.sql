@@ -300,6 +300,12 @@ ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_verified BOOLEAN DEFA
 ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_date     DATE;
 ALTER TABLE properties ADD COLUMN IF NOT EXISTS site_visit_notes    TEXT DEFAULT '';
 
+-- Simple per-property view counter for the owner analytics dashboard —
+-- a single incrementing counter rather than a full events table, since
+-- "roughly how many people looked at this listing" is what an owner
+-- actually wants, not a detailed audit trail.
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS view_count INTEGER DEFAULT 0;
+
 -- Lets a confirmed payment be traced back to the exact unit/property it was
 -- for, so confirming it can automatically create a Tenancy Tracker record
 -- (see handleSavePayment) instead of requiring a separate manual entry.
