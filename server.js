@@ -2452,6 +2452,45 @@ async function handleAddUnit(ownerId, propId, data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// Bulk-imports many units at once from a parsed CSV (parsing itself happens
+// client-side — this just accepts an already-parsed array of row objects,
+// same shape as a single handleAddUnit call). Photos aren't practical via
+// CSV (no way to embed image files in text), so bulk-imported units start
+// with no photo — the owner can add one per unit afterward the same way
+// they would for any manually-added unit.
+async function handleBulkAddUnits(ownerId, propId, data, res) {
+  if (ownerId) {
+    const own = await db.query('SELECT id FROM properties WHERE id=$1 AND owner_id=$2', [propId, ownerId]);
+    if (!own.rows.length) return json(res, 403, { error: 'Property not found or not yours' });
+  }
+  const rows = Array.isArray(data.units) ? data.units : [];
+  if (!rows.length) return json(res, 400, { error: 'No units provided' });
+  if (rows.length > 500) return json(res, 400, { error: 'Too many rows in one import (max 500) — split into smaller batches' });
+  const inserted = [];
+  const skipped = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] || {};
+    const unit_label = (row.unit_label || '').toString().trim();
+    if (!unit_label) { skipped.push({ row: i + 1, reason: 'Missing unit_label' }); continue; }
+    try {
+      const capacity = parseInt(row.capacity, 10);
+      const monthly_price = parseFloat(row.monthly_price);
+      const r = await db.query(
+        'INSERT INTO property_units (property_id,unit_label,unit_type,floor_level,capacity,monthly_price,notes,description) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,unit_label',
+        [propId, unit_label, (row.unit_type||'room').toString().trim() || 'room', (row.floor_level||'').toString().trim(),
+         Number.isFinite(capacity) && capacity > 0 ? capacity : 1,
+         Number.isFinite(monthly_price) && monthly_price > 0 ? monthly_price : null,
+         (row.notes||'').toString().trim(), (row.description||'').toString().trim()]
+      );
+      inserted.push(r.rows[0]);
+    } catch (e) {
+      skipped.push({ row: i + 1, reason: e.message });
+    }
+  }
+  await logActivity('Bulk-imported ' + inserted.length + ' unit(s) to property ' + propId + (skipped.length ? ' (' + skipped.length + ' skipped)' : ''));
+  json(res, 200, { success: true, inserted: inserted.length, skipped });
+}
+
 async function handleUpdateUnit(ownerId, propId, unitId, data, res) {
   if (ownerId) {
     const own = await db.query('SELECT id FROM properties WHERE id=$1 AND owner_id=$2', [propId, ownerId]);
@@ -2742,6 +2781,8 @@ const server = http.createServer((req, res) => {
           if (owPropMatch) return handleOwnerUpdateProperty(ownerId, owPropMatch[1], data, res);
           const owUnitMatch = url.match(/^\/owner\/property\/([^/]+)\/units$/);
           if (owUnitMatch) return handleAddUnit(ownerId, owUnitMatch[1], data, res);
+          const owUnitBulkMatch = url.match(/^\/owner\/property\/([^/]+)\/units\/bulk$/);
+          if (owUnitBulkMatch) return handleBulkAddUnits(ownerId, owUnitBulkMatch[1], data, res);
           const owUnitPatch = url.match(/^\/owner\/property\/([^/]+)\/units\/(\d+)$/);
           if (owUnitPatch) return handleUpdateUnit(ownerId, owUnitPatch[1], owUnitPatch[2], data, res);
           return json(res, 404, { error: 'Not found' });
