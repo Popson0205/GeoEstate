@@ -1269,26 +1269,39 @@ async function handleAdminUpdate(url, data, res) {
     const id = regMatch[1];
     const { status, reviewer, notes } = data;
     try {
+      const before = await db.query('SELECT status, fname FROM registrations WHERE id=$1', [id]);
+      const prevStatus = before.rows[0]?.status;
       await db.query(
         'UPDATE registrations SET status=$1, reviewer=$2, notes=$3, updated_at=NOW() WHERE id=$4',
         [status, reviewer||'Admin', notes||'', id]
       );
-      // If approved as owner, ensure owner capability
+      // Previously scoped to role='owner' only, so a regular renter/buyer
+      // getting their identity approved never actually got is_verified set
+      // true - login's response reads verified: user.is_verified for any
+      // role, so this silently broke verification for every non-owner
+      // customer, not just an owner-specific edge case.
       if (status === 'approved') {
         try {
-          await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
+          await db.query('UPDATE registrations SET is_verified=true WHERE id=$1', [id]);
         } catch(verifyErr) {
-          // is_verified column may not exist yet — add it and retry
           try {
             await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE");
             await db.query("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS owner_since TIMESTAMPTZ");
-            await db.query('UPDATE registrations SET is_verified=true WHERE id=$1 AND role=$2', [id, 'owner']);
+            await db.query('UPDATE registrations SET is_verified=true WHERE id=$1', [id]);
           } catch(e2) { console.warn('is_verified column fix failed:', e2.message); }
         }
       }
       await logActivity('Registration ' + status + ': ' + id);
       broadcast('registration_updated', { id, status });
       json(res, 200, { success: true });
+
+      // Notify the customer the moment their identity is actually approved
+      // (a genuine transition, not on every subsequent notes/reviewer edit) -
+      // previously nothing told them at all; they'd only find out by
+      // re-checking the app themselves.
+      if (status === 'approved' && status !== prevStatus) {
+        createNotification(id, 'identity_verified', '✅ Identity Verified', "You're now a verified GeoEstate member.", {}).catch(() => {});
+      }
     } catch(e) { json(res, 500, { error: e.message }); }
     return;
   }
