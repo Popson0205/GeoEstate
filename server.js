@@ -40,6 +40,16 @@ const RESEND_API_KEY = process.env.SECRET_RESEND_API_KEY;
 const FCM_SERVICE_ACCOUNT_RAW = process.env.SECRET_FCM_SERVICE_ACCOUNT || '';
 // ── Admin Auth Config ────────────────────────────────────────────────────────
 const ADMIN_EMAIL    = process.env.ADMIN_EMAIL;
+
+// Fixed, well-known ID for the shared "GeoEstate Support" account —
+// customers chat with this single identity rather than with a property's
+// actual owner directly (GeoEstate manages the transaction, not the
+// owner), and any staff member with access to its email can log in via
+// the existing owner OTP flow and see every customer conversation in one
+// shared Messages inbox. See ensureSupportAccount() below, which creates
+// this account automatically on boot if it doesn't already exist.
+const SUPPORT_USER_ID = 'SUPPORT-001';
+const SUPPORT_EMAIL = 'geoestate.ng@gmail.com';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const JWT_SECRET     = process.env.JWT_SECRET;
 if (!ADMIN_EMAIL || !ADMIN_PASSWORD || !JWT_SECRET) {
@@ -1673,6 +1683,23 @@ function tenancyReminderEmail(t, stage, forOwner) {
 // expiry, a final reminder at 2 weeks, and an expiry notice starting the
 // 3-week packing-out period. Each stage only ever fires once per tenancy,
 // tracked via the reminder_*_sent columns.
+// Creates the shared "GeoEstate Support" account on boot if it doesn't
+// already exist yet — idempotent (ON CONFLICT on the unique email column),
+// safe to run on every restart. Pre-approved and pre-verified since it's
+// not a real individual going through the normal review flow.
+async function ensureSupportAccount() {
+  try {
+    await db.query(
+      `INSERT INTO registrations (id, fname, lname, email, phone, role, type, status, is_verified, reviewer, notes)
+       VALUES ($1, 'GeoEstate', 'Support', $2, '', 'owner', 'owner', 'approved', true, 'System', 'Shared support inbox — customers chat with this account instead of a property owner directly.')
+       ON CONFLICT (email) DO NOTHING`,
+      [SUPPORT_USER_ID, SUPPORT_EMAIL]
+    );
+  } catch (e) {
+    console.error('ensureSupportAccount failed:', e.message);
+  }
+}
+
 async function checkTenancyReminders() {
   try {
     const r = await db.query(`
@@ -3130,3 +3157,4 @@ server.listen(PORT, () => console.log('✅ GeoEstate API v2.0 running on port ' 
 // needed.
 setTimeout(() => { checkTenancyReminders().catch(e => console.error('Initial tenancy reminder check failed:', e.message)); }, 30000);
 setInterval(() => { checkTenancyReminders().catch(e => console.error('Scheduled tenancy reminder check failed:', e.message)); }, 12 * 60 * 60 * 1000);
+ensureSupportAccount();
