@@ -297,11 +297,17 @@ async function sendPushNotification(deviceToken, title, body, data) {
   try {
     const accessToken = await getFcmAccessToken();
     if (!accessToken) return { skipped: true, reason: 'Could not get FCM access token' };
+    // FCM's data field must be Map<string,string> — any non-string value
+    // (e.g. a numeric tenancy_id) causes the whole request to be rejected,
+    // which previously would have been completely silent since the result
+    // was discarded at the call site.
+    const stringData = {};
+    Object.keys(data || {}).forEach(k => { stringData[k] = String(data[k]); });
     const payload = JSON.stringify({
       message: {
         token: deviceToken,
         notification: { title, body },
-        data: data || {},
+        data: stringData,
         android: { priority: 'high' }
       }
     });
@@ -976,6 +982,7 @@ async function handleRegisterPushToken(ownerId, data, res) {
     if (!token) return json(res, 400, { error: 'push_token required' });
     await db.query(`ALTER TABLE registrations ADD COLUMN IF NOT EXISTS push_token TEXT`).catch(() => {});
     await db.query('UPDATE registrations SET push_token=$1, updated_at=NOW() WHERE id=$2', [token, ownerId]);
+    await logActivity('Push token registered for ' + ownerId + ' (ends …' + token.slice(-8) + ')').catch(() => {});
     json(res, 200, { success: true });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
@@ -1009,10 +1016,30 @@ async function createNotification(userId, type, title, body, data) {
       [userId, type, title, body || '', JSON.stringify(data || {})]
     );
     broadcast('notification_new', { user_id: userId });
+
+    // The result of sendPushNotification was previously discarded entirely
+    // (.catch(()=>{}) only catches a rejected promise, not a resolved but
+    // failed {ok:false} result) - meaning a bad token, malformed request,
+    // or FCM error of any kind was completely silent, with no way to tell
+    // what was actually wrong. Logs the real outcome to the Activity Log
+    // (visible in admin.html) so this is diagnosable without needing
+    // Railway's console logs at all.
     const token = await getPushToken(userId);
-    if (token) sendPushNotification(token, title, body || '', Object.assign({ type }, data || {})).catch(() => {});
+    if (!token) {
+      await logActivity('Push skipped for ' + userId + ' (' + type + '): no device token registered').catch(() => {});
+      return;
+    }
+    const result = await sendPushNotification(token, title, body || '', Object.assign({ type }, data || {}));
+    if (result.skipped) {
+      await logActivity('Push skipped for ' + userId + ' (' + type + '): ' + (result.reason || 'unknown reason')).catch(() => {});
+    } else if (result.ok) {
+      await logActivity('Push sent to ' + userId + ' (' + type + ')').catch(() => {});
+    } else {
+      await logActivity('Push FAILED for ' + userId + ' (' + type + '): status=' + result.status + ' body=' + (result.body || result.error || '').toString().slice(0, 200)).catch(() => {});
+    }
   } catch (e) {
     console.error('createNotification failed for user ' + userId + ':', e.message);
+    await logActivity('createNotification error for ' + userId + ': ' + e.message).catch(() => {});
   }
 }
 
