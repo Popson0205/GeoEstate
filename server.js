@@ -188,6 +188,12 @@ function requireOwner(req, res) {
   parts.pop();   // remove timestamp
   const userId = parts.join(':');
   if (!userId || userId.length < 3) { json(res, 401, { error: 'Invalid token' }); return null; }
+  // Fire-and-forget (requireOwner is called synchronously everywhere, so
+  // this can't be awaited without touching every call site) — powers the
+  // "delivered" chat status: a message counts as delivered once the
+  // recipient has been active anywhere in the app since it was sent, not
+  // just when they open that specific thread (that's what read_at means).
+  db.query('UPDATE registrations SET last_active_at=NOW() WHERE id=$1', [userId]).catch(() => {});
   return userId;
 }
 
@@ -1122,7 +1128,24 @@ async function handleGetThread(userId, otherId, propertyId, res) {
     `, [userId, otherId, propertyId || '']);
     // Mark incoming messages as read
     await db.query(`UPDATE messages SET read_at=NOW() WHERE sender_id=$1 AND recipient_id=$2 AND read_at IS NULL AND (property_id=$3 OR ($3='' AND property_id IS NULL))`, [otherId, userId, propertyId || '']);
-    json(res, 200, { success: true, messages: r.rows });
+
+    // Sent/delivered/read status per message, for the sender's own bubbles
+    // (matching the WhatsApp-style single/double/blue-double tick
+    // convention — read_at already exists and is set precisely when the
+    // recipient opens this thread; "delivered" is a genuine signal too,
+    // not a fake middle state — it's true the moment the recipient has
+    // been active anywhere in the app since the message was sent, even if
+    // they haven't opened this specific thread yet).
+    const otherActiveR = await db.query('SELECT last_active_at FROM registrations WHERE id=$1', [otherId]);
+    const otherLastActive = otherActiveR.rows[0]?.last_active_at ? new Date(otherActiveR.rows[0].last_active_at) : null;
+    const messages = r.rows.map(m => {
+      let status = 'sent';
+      if (m.read_at) status = 'read';
+      else if (otherLastActive && new Date(m.created_at) <= otherLastActive) status = 'delivered';
+      return Object.assign({}, m, { status });
+    });
+
+    json(res, 200, { success: true, messages });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
@@ -1724,6 +1747,16 @@ async function ensureSupportAccount() {
     );
   } catch (e) {
     console.error('ensureSupportAccount failed:', e.message);
+  }
+}
+
+// last_active_at powers chat "delivered" status (see requireOwner) — ensured
+// once at boot rather than on every request via ALTER ... IF NOT EXISTS.
+async function ensureLastActiveColumn() {
+  try {
+    await db.query(`ALTER TABLE registrations ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ`);
+  } catch (e) {
+    console.error('ensureLastActiveColumn failed:', e.message);
   }
 }
 
@@ -3185,3 +3218,4 @@ server.listen(PORT, () => console.log('✅ GeoEstate API v2.0 running on port ' 
 setTimeout(() => { checkTenancyReminders().catch(e => console.error('Initial tenancy reminder check failed:', e.message)); }, 30000);
 setInterval(() => { checkTenancyReminders().catch(e => console.error('Scheduled tenancy reminder check failed:', e.message)); }, 12 * 60 * 60 * 1000);
 ensureSupportAccount();
+ensureLastActiveColumn();

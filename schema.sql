@@ -266,6 +266,9 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
 -- Owner verification columns
 ALTER TABLE registrations ADD COLUMN IF NOT EXISTS is_verified     BOOLEAN DEFAULT FALSE;
 ALTER TABLE registrations ADD COLUMN IF NOT EXISTS owner_since     TIMESTAMPTZ;
+-- Powers chat "delivered" status (see requireOwner/handleGetThread) —
+-- updated on every authenticated request, not just message-related ones.
+ALTER TABLE registrations ADD COLUMN IF NOT EXISTS last_active_at  TIMESTAMPTZ;
 
 -- Supabase Storage upload URLs (v2.1 — replaces old Cloudinary fields)
 ALTER TABLE registrations ADD COLUMN IF NOT EXISTS photo_url       TEXT DEFAULT NULL;
