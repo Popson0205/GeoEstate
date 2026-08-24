@@ -1737,6 +1737,156 @@ function tenancyReminderEmail(t, stage, forOwner) {
 // already exist yet — idempotent (ON CONFLICT on the unique email column),
 // safe to run on every restart. Pre-approved and pre-verified since it's
 // not a real individual going through the normal review flow.
+// ── TOTP (RFC 6238) — authenticator app login for the shared support inbox ──
+// Implemented directly against Node's built-in crypto (HMAC-SHA1) rather
+// than pulling in a library — this is a small, well-specified standard
+// algorithm (the same one behind Google Authenticator, Authy, Microsoft
+// Authenticator, 1Password, etc.), and one fewer new dependency to trust
+// this close to launch.
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(buffer) {
+  let bits = '', output = '';
+  for (const byte of buffer) bits += byte.toString(2).padStart(8, '0');
+  for (let i = 0; i < bits.length; i += 5) {
+    const chunk = bits.substr(i, 5).padEnd(5, '0');
+    output += BASE32_ALPHABET[parseInt(chunk, 2)];
+  }
+  return output;
+}
+
+function base32Decode(str) {
+  const clean = str.toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = '';
+  for (const char of clean) {
+    const val = BASE32_ALPHABET.indexOf(char);
+    if (val === -1) continue;
+    bits += val.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.substr(i, 8), 2));
+  return Buffer.from(bytes);
+}
+
+function generateTotpSecret() {
+  return base32Encode(crypto.randomBytes(20)); // 160-bit secret, standard strength
+}
+
+// otpauth:// URI that authenticator apps read via QR code — issuer/label
+// are what shows up in the app's UI.
+function totpKeyUri(secret, email) {
+  const issuer = encodeURIComponent('GeoEstate Support');
+  const label = encodeURIComponent('GeoEstate Support:' + email);
+  return `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
+}
+
+function hotpCode(secretBuffer, counter) {
+  const counterBuffer = Buffer.alloc(8);
+  counterBuffer.writeBigUInt64BE(BigInt(counter));
+  const hmac = crypto.createHmac('sha1', secretBuffer).update(counterBuffer).digest();
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const binCode = ((hmac[offset] & 0x7f) << 24) | ((hmac[offset + 1] & 0xff) << 16) | ((hmac[offset + 2] & 0xff) << 8) | (hmac[offset + 3] & 0xff);
+  return String(binCode % 1000000).padStart(6, '0');
+}
+
+// Accepts the current 30s window and one step either side, so a code
+// generated just before/after a window boundary (or minor clock drift
+// between the phone and the server) still verifies correctly.
+function verifyTotpCode(secretBase32, code) {
+  if (!code || !/^\d{6}$/.test(code)) return false;
+  const secretBuffer = base32Decode(secretBase32);
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  for (let drift = -1; drift <= 1; drift++) {
+    if (hotpCode(secretBuffer, counter + drift) === code) return true;
+  }
+  return false;
+}
+
+// ── Support staff TOTP enrollment & login ────────────────────────────────
+// 4 (or however many) individually-enrolled staff members can each log
+// into the SAME shared "GeoEstate Support" inbox using their own
+// authenticator app code, instead of everyone sharing one email+OTP.
+// Deliberately doesn't touch the chat/messages model at all — a
+// successful TOTP login just issues the exact same owner:SUPPORT-001:...
+// token every other login path already produces, so every existing
+// endpoint (conversations, messages, push, etc.) keeps working unchanged.
+async function ensureSupportStaffTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS support_staff (
+    id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+    totp_secret TEXT NOT NULL, revoked BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_login_at TIMESTAMPTZ
+  )`).catch(() => {});
+}
+
+async function handleAddSupportStaff(data, res) {
+  const { name, email } = data || {};
+  if (!name || !email) return json(res, 400, { error: 'name and email required' });
+  try {
+    await ensureSupportStaffTable();
+    const secret = generateTotpSecret();
+    const r = await db.query(
+      'INSERT INTO support_staff (name, email, totp_secret) VALUES ($1,$2,$3) ON CONFLICT (email) DO UPDATE SET totp_secret=$3, revoked=false RETURNING id',
+      [name.trim(), email.trim().toLowerCase(), secret]
+    );
+    await logActivity('Support staff enrolled: ' + name + ' (' + email + ')').catch(() => {});
+    // Secret/URI only ever returned here, at enrollment — never in the
+    // list endpoint below, so it can't leak just by viewing staff later.
+    json(res, 200, { success: true, id: r.rows[0].id, secret, otpauth_uri: totpKeyUri(secret, email) });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleRegenerateSupportStaff(id, res) {
+  try {
+    await ensureSupportStaffTable();
+    const secret = generateTotpSecret();
+    const r = await db.query('UPDATE support_staff SET totp_secret=$1, revoked=false WHERE id=$2 RETURNING email, name', [secret, id]);
+    if (!r.rows.length) return json(res, 404, { error: 'Staff member not found' });
+    await logActivity('Support staff credential reset: ' + r.rows[0].name).catch(() => {});
+    json(res, 200, { success: true, secret, otpauth_uri: totpKeyUri(secret, r.rows[0].email) });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleListSupportStaff(res) {
+  try {
+    await ensureSupportStaffTable();
+    const r = await db.query('SELECT id, name, email, revoked, created_at, last_login_at FROM support_staff ORDER BY created_at ASC');
+    json(res, 200, { success: true, staff: r.rows });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleRevokeSupportStaff(id, res) {
+  try {
+    await ensureSupportStaffTable();
+    const r = await db.query('UPDATE support_staff SET revoked=true WHERE id=$1 RETURNING name', [id]);
+    if (!r.rows.length) return json(res, 404, { error: 'Staff member not found' });
+    await logActivity('Support staff access revoked: ' + r.rows[0].name).catch(() => {});
+    json(res, 200, { success: true });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
+// The actual login — public endpoint (this IS how a staff member logs in),
+// verified against their own enrolled secret, but issues a token for the
+// shared SUPPORT_USER_ID so the rest of the backend needs zero changes.
+async function handleSupportStaffLogin(data, res) {
+  const { email, code } = data || {};
+  if (!email || !code) return json(res, 400, { error: 'email and code required' });
+  try {
+    await ensureSupportStaffTable();
+    const r = await db.query('SELECT * FROM support_staff WHERE email=$1 AND revoked=false', [email.trim().toLowerCase()]);
+    if (!r.rows.length) return json(res, 401, { error: 'Not an enrolled support staff email' });
+    const staff = r.rows[0];
+    if (!verifyTotpCode(staff.totp_secret, String(code).trim())) {
+      return json(res, 401, { error: 'Incorrect or expired code' });
+    }
+    await db.query('UPDATE support_staff SET last_login_at=NOW() WHERE id=$1', [staff.id]);
+    const supportR = await db.query('SELECT * FROM registrations WHERE id=$1', [SUPPORT_USER_ID]);
+    const owner = supportR.rows[0] || { id: SUPPORT_USER_ID, fname: 'GeoEstate', lname: 'Support', email: SUPPORT_EMAIL };
+    const token = 'owner:' + SUPPORT_USER_ID + ':' + Date.now();
+    await logActivity('Support staff login: ' + staff.name).catch(() => {});
+    json(res, 200, { success: true, token, owner, staff_name: staff.name });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
 async function ensureSupportAccount() {
   try {
     await db.query(
@@ -2931,6 +3081,7 @@ const server = http.createServer((req, res) => {
       if (url === '/admin/payments')         return handleGetPayments(res);
       if (url === '/admin/sync')             return handleGetSync(res);
       if (url === '/admin/enquiries')        return handleGetAdminEnquiries(res);
+      if (url === '/admin/support-staff')    return handleListSupportStaff(res);
       const unitAdminMatch = url.match(/^\/admin\/property\/([^/]+)\/units$/);
       if (unitAdminMatch)                    return handleAdminGetUnits(unitAdminMatch[1], res);
       return json(res, 404, { error: 'Not found' });
@@ -2977,6 +3128,8 @@ const server = http.createServer((req, res) => {
       if (prMatch) return handleDeleteProperty(prMatch[1], res);
       const tnMatch = url.match(/^\/admin\/tenancy\/(\d+)$/);
       if (tnMatch) return handleDeleteTenancy(tnMatch[1], res);
+      const staffMatch = url.match(/^\/admin\/support-staff\/(\d+)$/);
+      if (staffMatch) return handleRevokeSupportStaff(staffMatch[1], res);
     }
     if (url.startsWith('/owner/')) {
       const ownerId = requireOwner(req, res);
@@ -3019,6 +3172,7 @@ const server = http.createServer((req, res) => {
         // Owner auth (no token needed)
         if (url === '/owner/login')          return handleOwnerLogin(data, res);
         if (url === '/partner/login')        return handlePartnerLogin(data, res);
+        if (url === '/support/login')        return handleSupportStaffLogin(data, res);
 
         // Owner routes (token required)
         if (url.startsWith('/owner/')) {
@@ -3056,6 +3210,9 @@ const server = http.createServer((req, res) => {
           if (url === '/admin/save-tenancy')        return handleSaveTenancy(data, res);
           if (url === '/admin/save-payment')        return handleSavePayment(data, res);
           if (url === '/admin/save-transaction')    return handleSaveTransaction(data, res);
+          if (url === '/admin/support-staff')       return handleAddSupportStaff(data, res);
+          const staffRegenMatch = url.match(/^\/admin\/support-staff\/(\d+)\/regenerate$/);
+          if (staffRegenMatch) return handleRegenerateSupportStaff(staffRegenMatch[1], res);
           const disUpdate = url.match(/^\/admin\/dispute\/([^/]+)$/);
           if (disUpdate) return handleUpdateDispute(disUpdate[1], data, res);
           const unitAdminAdd = url.match(/^\/admin\/property\/([^/]+)\/units$/);

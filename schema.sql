@@ -327,6 +327,21 @@ CREATE TABLE IF NOT EXISTS tenancy_agreements (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Individually-enrolled staff logins for the shared "GeoEstate Support"
+-- chat inbox — each row is one person's own TOTP (authenticator app)
+-- credential; a successful login against any non-revoked row here issues
+-- a token for SUPPORT_USER_ID, so the chat/messages model itself never
+-- needs to know about individual staff at all.
+CREATE TABLE IF NOT EXISTS support_staff (
+  id             SERIAL PRIMARY KEY,
+  name           TEXT NOT NULL,
+  email          TEXT NOT NULL UNIQUE,
+  totp_secret    TEXT NOT NULL,
+  revoked        BOOLEAN DEFAULT FALSE,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_login_at  TIMESTAMPTZ
+);
+
 -- Lets a confirmed payment be traced back to the exact unit/property it was
 -- for, so confirming it can automatically create a Tenancy Tracker record
 -- (see handleSavePayment) instead of requiring a separate manual entry.
