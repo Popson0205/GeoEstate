@@ -872,6 +872,36 @@ async function handleOwnerTenancies(ownerId, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// The customer/tenant-facing equivalent of handleOwnerTenancies above —
+// same shape, scoped by tenant_id instead of the property's owner_id.
+// This was the actual missing piece behind "tenancy tracker" and
+// "e-signature" only ever being reachable from the Owner Dashboard: the
+// backend for a tenant viewing/signing their own agreement already
+// existed (getTenancyForUser already resolves role as 'owner' or
+// 'tenant'), there was just no endpoint for a tenant to find their own
+// tenancy id in the first place, and no customer-facing screen to call it.
+async function handleMyTenancies(tenantId, res) {
+  try {
+    const result = await db.query(`
+      SELECT t.*,
+        CASE WHEN t.end_date <= CURRENT_DATE + INTERVAL '30 days' AND t.status='active' THEN true ELSE false END as expiring_soon
+      FROM tenancies t
+      WHERE t.tenant_id = $1
+      ORDER BY t.end_date ASC
+    `, [tenantId]);
+    const rows = result.rows.map(r => ({
+      id: r.id, ref: r.ref, type: r.type, property: r.property,
+      propertyId: r.property_id, unitId: r.unit_id,
+      tenant: r.tenant, owner: r.owner,
+      amount: r.amount, start: r.start_date, end: r.end_date,
+      status: r.status, packingOutDate: r.packing_out_date,
+      renewedAt: r.renewed_at, vacatedAt: r.vacated_at,
+      expiringSoon: r.expiring_soon
+    }));
+    json(res, 200, { success: true, tenancies: rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 // ── E-signature tenancy agreements ───────────────────────────────────────
 // A typed-name signature + timestamp, a widely-used and generally accepted
 // e-signature pattern — not a full certificate-based e-signature system.
@@ -3140,6 +3170,7 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/properties')       return handleOwnerProperties(ownerId, urlFull, res);
       if (url === '/owner/enquiries')        return handleOwnerEnquiries(ownerId, res);
       if (url === '/owner/tenancies')        return handleOwnerTenancies(ownerId, res);
+      if (url === '/owner/my-tenancies')     return handleMyTenancies(ownerId, res);
       if (url === '/owner/analytics')        return handleOwnerAnalytics(ownerId, res);
       const agreementGetMatch = url.match(/^\/owner\/tenancy\/(\d+)\/agreement$/);
       if (agreementGetMatch) return handleGetTenancyAgreement(ownerId, agreementGetMatch[1], res);
