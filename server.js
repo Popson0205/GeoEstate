@@ -1814,8 +1814,25 @@ async function ensureSupportStaffTable() {
   await db.query(`CREATE TABLE IF NOT EXISTS support_staff (
     id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
     totp_secret TEXT NOT NULL, revoked BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_login_at TIMESTAMPTZ
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_login_at TIMESTAMPTZ,
+    setup_token TEXT, setup_token_expires_at TIMESTAMPTZ
   )`).catch(() => {});
+  // Self-heals an already-existing table from before these columns existed.
+  await db.query(`ALTER TABLE support_staff ADD COLUMN IF NOT EXISTS setup_token TEXT`).catch(() => {});
+  await db.query(`ALTER TABLE support_staff ADD COLUMN IF NOT EXISTS setup_token_expires_at TIMESTAMPTZ`).catch(() => {});
+}
+
+// A random, unguessable link the admin can send directly to a staff member
+// (WhatsApp, email, SMS) instead of requiring them to be physically present
+// to scan a QR code — some authenticator apps (Microsoft Authenticator,
+// notably) don't reliably support tapping a raw otpauth:// link to add an
+// account, so this shows both the QR code AND the manual-entry key as
+// plain text, which every authenticator app supports identically. Valid
+// for 7 days, not single-use-on-view (so a dropped connection while the
+// page loads isn't a dead end) — if it needs to be invalidated early,
+// generating a new one (enroll/regenerate again) overwrites it.
+function buildStaffSetupUrl(token) {
+  return 'https://www.geoestate.com.ng/staff-setup.html?token=' + token;
 }
 
 async function handleAddSupportStaff(data, res) {
@@ -1824,14 +1841,18 @@ async function handleAddSupportStaff(data, res) {
   try {
     await ensureSupportStaffTable();
     const secret = generateTotpSecret();
+    const setupToken = crypto.randomBytes(24).toString('hex');
     const r = await db.query(
-      'INSERT INTO support_staff (name, email, totp_secret) VALUES ($1,$2,$3) ON CONFLICT (email) DO UPDATE SET totp_secret=$3, revoked=false RETURNING id',
-      [name.trim(), email.trim().toLowerCase(), secret]
+      `INSERT INTO support_staff (name, email, totp_secret, setup_token, setup_token_expires_at)
+       VALUES ($1,$2,$3,$4,NOW() + INTERVAL '7 days')
+       ON CONFLICT (email) DO UPDATE SET totp_secret=$3, revoked=false, setup_token=$4, setup_token_expires_at=NOW() + INTERVAL '7 days'
+       RETURNING id`,
+      [name.trim(), email.trim().toLowerCase(), secret, setupToken]
     );
     await logActivity('Support staff enrolled: ' + name + ' (' + email + ')').catch(() => {});
     // Secret/URI only ever returned here, at enrollment — never in the
     // list endpoint below, so it can't leak just by viewing staff later.
-    json(res, 200, { success: true, id: r.rows[0].id, secret, otpauth_uri: totpKeyUri(secret, email) });
+    json(res, 200, { success: true, id: r.rows[0].id, secret, otpauth_uri: totpKeyUri(secret, email), setup_url: buildStaffSetupUrl(setupToken) });
   } catch (e) { json(res, 500, { error: e.message }); }
 }
 
@@ -1839,10 +1860,30 @@ async function handleRegenerateSupportStaff(id, res) {
   try {
     await ensureSupportStaffTable();
     const secret = generateTotpSecret();
-    const r = await db.query('UPDATE support_staff SET totp_secret=$1, revoked=false WHERE id=$2 RETURNING email, name', [secret, id]);
+    const setupToken = crypto.randomBytes(24).toString('hex');
+    const r = await db.query(
+      `UPDATE support_staff SET totp_secret=$1, revoked=false, setup_token=$2, setup_token_expires_at=NOW() + INTERVAL '7 days' WHERE id=$3 RETURNING email, name`,
+      [secret, setupToken, id]
+    );
     if (!r.rows.length) return json(res, 404, { error: 'Staff member not found' });
     await logActivity('Support staff credential reset: ' + r.rows[0].name).catch(() => {});
-    json(res, 200, { success: true, secret, otpauth_uri: totpKeyUri(secret, r.rows[0].email) });
+    json(res, 200, { success: true, secret, otpauth_uri: totpKeyUri(secret, r.rows[0].email), setup_url: buildStaffSetupUrl(setupToken) });
+  } catch (e) { json(res, 500, { error: e.message }); }
+}
+
+// Public — the staff member opens this (via the link the admin sent them)
+// on their own phone, no admin auth involved. Returns everything the
+// enrollment modal would have shown in person.
+async function handleGetStaffSetup(token, res) {
+  try {
+    await ensureSupportStaffTable();
+    const r = await db.query(
+      `SELECT name, email, totp_secret FROM support_staff WHERE setup_token=$1 AND setup_token_expires_at > NOW() AND revoked=false`,
+      [token]
+    );
+    if (!r.rows.length) return json(res, 404, { error: 'This setup link has expired or is no longer valid — ask an admin to send you a new one.' });
+    const staff = r.rows[0];
+    json(res, 200, { success: true, name: staff.name, email: staff.email, secret: staff.totp_secret, otpauth_uri: totpKeyUri(staff.totp_secret, staff.email) });
   } catch (e) { json(res, 500, { error: e.message }); }
 }
 
@@ -3061,6 +3102,10 @@ const server = http.createServer((req, res) => {
     if (ownerRatingsMatch) return handleGetOwnerRatings(ownerRatingsMatch[1], res);
     if (url.match(/^\/properties\/([^/]+)$/)) return handlePublicPropertyById(url.split('/')[2], res);
     if (url === '/events')                   return handleSSE(req, res);
+    if (url === '/support-staff-setup') {
+      const token = new URL('http://x' + urlFull).searchParams.get('token');
+      return handleGetStaffSetup(token, res);
+    }
 
     // Admin routes — require token
     if (url.startsWith('/admin/')) {

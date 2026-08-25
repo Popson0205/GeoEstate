@@ -333,13 +333,18 @@ CREATE TABLE IF NOT EXISTS tenancy_agreements (
 -- a token for SUPPORT_USER_ID, so the chat/messages model itself never
 -- needs to know about individual staff at all.
 CREATE TABLE IF NOT EXISTS support_staff (
-  id             SERIAL PRIMARY KEY,
-  name           TEXT NOT NULL,
-  email          TEXT NOT NULL UNIQUE,
-  totp_secret    TEXT NOT NULL,
-  revoked        BOOLEAN DEFAULT FALSE,
-  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_login_at  TIMESTAMPTZ
+  id                      SERIAL PRIMARY KEY,
+  name                    TEXT NOT NULL,
+  email                   TEXT NOT NULL UNIQUE,
+  totp_secret             TEXT NOT NULL,
+  revoked                 BOOLEAN DEFAULT FALSE,
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_login_at           TIMESTAMPTZ,
+  -- Powers a remote setup link (see buildStaffSetupUrl/handleGetStaffSetup)
+  -- for staff who can't be physically present to scan a QR code — random,
+  -- unguessable, valid for 7 days from generation.
+  setup_token             TEXT,
+  setup_token_expires_at  TIMESTAMPTZ
 );
 
 -- Lets a confirmed payment be traced back to the exact unit/property it was
