@@ -353,6 +353,23 @@ CREATE TABLE IF NOT EXISTS support_staff (
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS unit_id     INTEGER REFERENCES property_units(id);
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS property_id TEXT REFERENCES properties(id);
 
+-- Captured directly from the owner at the moment they sign the tenancy
+-- agreement — a stronger source of truth than the free-text owner_acct
+-- field on payments (which admin types in manually, usually from a phone
+-- call/WhatsApp message, with no verification at all). Only required when
+-- the SIGNER is the owner (see handleSignTenancyAgreement) — this is what
+-- lets admin actually see, at release time, that the owner themselves
+-- supplied and committed to this specific payout destination.
+ALTER TABLE tenancy_agreements ADD COLUMN IF NOT EXISTS owner_bank_name TEXT;
+ALTER TABLE tenancy_agreements ADD COLUMN IF NOT EXISTS owner_account_number TEXT;
+ALTER TABLE tenancy_agreements ADD COLUMN IF NOT EXISTS owner_account_name TEXT;
+
+-- A distinct, trackable "handover happened" step — previously the only
+-- signal was payment status flipping to 'confirmed', with no way to tell
+-- whether the physical/practical handover itself had actually occurred.
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS handover_confirmed_at TIMESTAMPTZ;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS handover_confirmed_by TEXT;
+
 -- Backfill listing_type from type column on existing rows
 UPDATE properties SET listing_type = type WHERE listing_type IS NULL OR listing_type = '';
 

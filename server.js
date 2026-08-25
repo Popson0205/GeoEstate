@@ -915,6 +915,11 @@ async function ensureAgreementsTable() {
     tenant_signature TEXT, tenant_signed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`).catch(() => {});
+  // Self-heals an already-existing table from before owner bank details
+  // were captured at signing.
+  await db.query(`ALTER TABLE tenancy_agreements ADD COLUMN IF NOT EXISTS owner_bank_name TEXT`).catch(() => {});
+  await db.query(`ALTER TABLE tenancy_agreements ADD COLUMN IF NOT EXISTS owner_account_number TEXT`).catch(() => {});
+  await db.query(`ALTER TABLE tenancy_agreements ADD COLUMN IF NOT EXISTS owner_account_name TEXT`).catch(() => {});
 }
 
 // Determines whether the given user is the owner or the tenant on a
@@ -992,9 +997,28 @@ async function handleSignTenancyAgreement(userId, tenancyId, data, res) {
     if (!info.role) return json(res, 403, { error: 'You are not a party to this tenancy' });
     const agR = await db.query('SELECT id FROM tenancy_agreements WHERE tenancy_id=$1', [tenancyId]);
     if (!agR.rows.length) return json(res, 400, { error: 'Agreement not generated yet — view it first' });
-    const col = info.role === 'owner' ? 'owner_signature' : 'tenant_signature';
-    const dateCol = info.role === 'owner' ? 'owner_signed_at' : 'tenant_signed_at';
-    await db.query(`UPDATE tenancy_agreements SET ${col}=$1, ${dateCol}=NOW() WHERE tenancy_id=$2`, [signature, tenancyId]);
+
+    if (info.role === 'owner') {
+      // Captured directly from the owner at the moment of signing — a
+      // stronger source of truth than the free-text owner_acct field admin
+      // types in manually elsewhere, usually from a phone call/WhatsApp
+      // message with no verification at all. Required (not optional) so
+      // admin always has a real, owner-supplied payout destination on file
+      // by the time an agreement is fully signed, not just a signature.
+      const bankName = (data.bank_name || '').toString().trim();
+      const accountNumber = (data.account_number || '').toString().trim();
+      const accountName = (data.account_name || '').toString().trim();
+      if (!bankName || !accountNumber || !accountName) {
+        return json(res, 400, { error: 'Bank name, account number, and account name are all required to sign as the owner' });
+      }
+      await db.query(
+        `UPDATE tenancy_agreements SET owner_signature=$1, owner_signed_at=NOW(), owner_bank_name=$2, owner_account_number=$3, owner_account_name=$4 WHERE tenancy_id=$5`,
+        [signature, bankName, accountNumber, accountName, tenancyId]
+      );
+    } else {
+      await db.query(`UPDATE tenancy_agreements SET tenant_signature=$1, tenant_signed_at=NOW() WHERE tenancy_id=$2`, [signature, tenancyId]);
+    }
+
     await logActivity('Tenancy agreement signed by ' + info.role + ' (' + signature + ') for tenancy ' + tenancyId);
     const updated = await db.query('SELECT * FROM tenancy_agreements WHERE tenancy_id=$1', [tenancyId]);
     const ag = updated.rows[0];
@@ -2037,8 +2061,60 @@ async function getPropertyOwnerEmail(propertyId) {
 
 async function handleGetPayments(res) {
   try {
-    const r = await db.query('SELECT * FROM payments ORDER BY created_at DESC');
+    await ensureAgreementsTable();
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS handover_confirmed_at TIMESTAMPTZ`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS handover_confirmed_by TEXT`).catch(() => {});
+    // Joins in agreement signing status + owner-supplied bank details
+    // (captured at signing — see handleSignTenancyAgreement) right on each
+    // payment row, so admin/sales can see readiness-to-release without a
+    // separate lookup per payment. Tenancy ref is always 'TEN-FROM-' + the
+    // payment ref (see createTenancyRecord's caller) — a plain string
+    // match, not a stored foreign key, so this is a LEFT JOIN rather than
+    // an inner one: payments with no auto-created tenancy (e.g. a 'buy'
+    // transaction, which never creates one) still return normally, just
+    // with these fields null.
+    const r = await db.query(`
+      SELECT p.*,
+        t.id as resolved_tenancy_id,
+        ta.owner_signature, ta.owner_signed_at,
+        ta.tenant_signature, ta.tenant_signed_at,
+        ta.owner_bank_name, ta.owner_account_number, ta.owner_account_name
+      FROM payments p
+      LEFT JOIN tenancies t ON t.ref = 'TEN-FROM-' || p.ref
+      LEFT JOIN tenancy_agreements ta ON ta.tenancy_id = t.id
+      ORDER BY p.created_at DESC
+    `);
     json(res, 200, { success: true, payments: r.rows });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// A distinct, trackable "handover happened" step — previously the only
+// signal was payment status flipping to 'confirmed', with no way to tell
+// whether the physical/practical handover itself had actually occurred.
+// Deliberately doesn't require the agreement to be signed first (admin
+// keeps the judgment call — this just records the fact and notifies both
+// sides), matching how release itself isn't hard-blocked either.
+async function handleConfirmHandover(req, res, ref) {
+  const admin = requireAdmin(req, res);
+  if (!admin) return;
+  try {
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS handover_confirmed_at TIMESTAMPTZ`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS handover_confirmed_by TEXT`).catch(() => {});
+    await db.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS buyer_email TEXT DEFAULT ''`).catch(() => {});
+    const r = await db.query(
+      `UPDATE payments SET handover_confirmed_at=NOW(), handover_confirmed_by=$1 WHERE ref=$2 RETURNING *`,
+      [admin.email || 'Admin', ref]
+    );
+    if (!r.rows.length) return json(res, 404, { error: 'Payment not found' });
+    const p = r.rows[0];
+    await logActivity('Handover confirmed for ' + p.prop + ' (' + ref + ') by ' + (admin.email || 'Admin'));
+
+    const propOwnerId = p.property_id ? (await db.query('SELECT owner_id FROM properties WHERE id=$1', [p.property_id])).rows[0]?.owner_id : null;
+    const buyerUserId = p.buyer_email ? (await db.query('SELECT id FROM registrations WHERE email=$1', [p.buyer_email])).rows[0]?.id : null;
+    if (propOwnerId) createNotification(propOwnerId, 'handover_complete', '🤝 Handover Complete', p.prop + ' — the property has been handed over', { ref }).catch(() => {});
+    if (buyerUserId) createNotification(buyerUserId, 'handover_complete', '🤝 Handover Complete', 'You now have access to ' + p.prop, { ref }).catch(() => {});
+
+    json(res, 200, { success: true, payment: p });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
@@ -3287,6 +3363,8 @@ const server = http.createServer((req, res) => {
           if (url === '/admin/save-payment')        return handleSavePayment(data, res);
           if (url === '/admin/save-transaction')    return handleSaveTransaction(data, res);
           if (url === '/admin/support-staff')       return handleAddSupportStaff(data, res);
+          const handoverMatch = url.match(/^\/admin\/payment\/([^/]+)\/handover$/);
+          if (handoverMatch) return handleConfirmHandover(req, res, handoverMatch[1]);
           const staffRegenMatch = url.match(/^\/admin\/support-staff\/(\d+)\/regenerate$/);
           if (staffRegenMatch) return handleRegenerateSupportStaff(staffRegenMatch[1], res);
           const disUpdate = url.match(/^\/admin\/dispute\/([^/]+)$/);
