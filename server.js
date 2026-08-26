@@ -883,16 +883,17 @@ async function handleOwnerTenancies(ownerId, res) {
 async function handleMyTenancies(tenantId, res) {
   try {
     const result = await db.query(`
-      SELECT t.*,
+      SELECT t.*, p.owner_id as resolved_owner_id,
         CASE WHEN t.end_date <= CURRENT_DATE + INTERVAL '30 days' AND t.status='active' THEN true ELSE false END as expiring_soon
       FROM tenancies t
+      LEFT JOIN properties p ON p.id = t.property_id
       WHERE t.tenant_id = $1
       ORDER BY t.end_date ASC
     `, [tenantId]);
     const rows = result.rows.map(r => ({
       id: r.id, ref: r.ref, type: r.type, property: r.property,
       propertyId: r.property_id, unitId: r.unit_id,
-      tenant: r.tenant, owner: r.owner,
+      tenant: r.tenant, owner: r.owner, ownerId: r.resolved_owner_id || '',
       amount: r.amount, start: r.start_date, end: r.end_date,
       status: r.status, packingOutDate: r.packing_out_date,
       renewedAt: r.renewed_at, vacatedAt: r.vacated_at,
