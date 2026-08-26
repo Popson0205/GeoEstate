@@ -1678,6 +1678,64 @@ async function handleSubmitDispute(data, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
+// ── Geospatial consulting leads (GeoEstate Spatial Intelligence site) ───────
+// Public inbound lead form - separate business line from the property
+// marketplace, but reuses this same backend's DB/email infrastructure
+// rather than needing its own server, matching how /submit-dispute and
+// /submit-property already work as public POST endpoints with no auth.
+async function ensureGeospatialLeadsTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS geospatial_leads (
+    id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT,
+    organization TEXT, services TEXT, message TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`).catch(() => {});
+}
+
+function geospatialLeadNotifyEmail(lead) {
+  return `
+    <div style="font-family:sans-serif;max-width:560px">
+      <h2 style="color:#0f1b2e">New Geospatial Consulting Lead</h2>
+      <table style="width:100%;border-collapse:collapse;font-size:14px">
+        <tr><td style="padding:6px 0;color:#5c6b7a;width:120px">Name</td><td style="padding:6px 0"><strong>${lead.name}</strong></td></tr>
+        <tr><td style="padding:6px 0;color:#5c6b7a">Email</td><td style="padding:6px 0">${lead.email}</td></tr>
+        <tr><td style="padding:6px 0;color:#5c6b7a">Phone</td><td style="padding:6px 0">${lead.phone || '—'}</td></tr>
+        <tr><td style="padding:6px 0;color:#5c6b7a">Organization</td><td style="padding:6px 0">${lead.organization || '—'}</td></tr>
+        <tr><td style="padding:6px 0;color:#5c6b7a;vertical-align:top">Services</td><td style="padding:6px 0">${lead.services || '—'}</td></tr>
+      </table>
+      <div style="margin-top:16px;padding:14px;background:#f5f4f0;border-radius:6px;font-size:14px;color:#0f1b2e;white-space:pre-wrap">${(lead.message || '(no message provided)').replace(/</g,'&lt;')}</div>
+    </div>
+  `;
+}
+
+function geospatialLeadConfirmEmail(lead) {
+  return `
+    <div style="font-family:sans-serif;max-width:560px">
+      <h2 style="color:#0f1b2e">Thanks, ${lead.name.split(' ')[0]} — we've got your request</h2>
+      <p style="color:#5c6b7a;font-size:14px;line-height:1.6">Someone from GeoEstate Spatial Intelligence will follow up within one business day to scope your project. If it's urgent, you can also reach us directly at +234 916 042 0100.</p>
+      <p style="color:#5c6b7a;font-size:14px;line-height:1.6">— GeoEstate Spatial Intelligence, a division of GeoEstate NIG Limited</p>
+    </div>
+  `;
+}
+
+async function handleGeospatialLead(data, res) {
+  const { name, email, phone, organization, services, message } = data;
+  if (!name || !email) return json(res, 400, { error: 'Name and email are required' });
+  try {
+    await ensureGeospatialLeadsTable();
+    const servicesStr = Array.isArray(services) ? services.join(', ') : (services || '');
+    await db.query(
+      'INSERT INTO geospatial_leads (name, email, phone, organization, services, message) VALUES ($1,$2,$3,$4,$5,$6)',
+      [name, email, phone || '', organization || '', servicesStr, message || '']
+    );
+    await logActivity('Geospatial consulting lead: ' + name + (organization ? ' (' + organization + ')' : '')).catch(() => {});
+    const leadData = { name, email, phone, organization, services: servicesStr, message };
+    if (ADMIN_EMAIL) sendEmail(ADMIN_EMAIL, 'New Geospatial Consulting Lead: ' + name, geospatialLeadNotifyEmail(leadData)).catch(() => {});
+    sendEmail(email, "We've received your request — GeoEstate Spatial Intelligence", geospatialLeadConfirmEmail(leadData)).catch(() => {});
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
 async function handleUpdateDispute(id, data, res) {
   const { status, lawyerAssigned, npfFiled, notes } = data;
   try {
@@ -3321,6 +3379,7 @@ const server = http.createServer((req, res) => {
         if (url === '/submit-payment')       return handleSubmitPayment(data, res);
         if (url === '/upload-sign')           return handleSupabaseUploadSign(data, res);
         if (url === '/submit-dispute')       return handleSubmitDispute(data, res);
+        if (url === '/geospatial-leads')     return handleGeospatialLead(data, res);
 
         // Owner auth (no token needed)
         if (url === '/owner/login')          return handleOwnerLogin(data, res);

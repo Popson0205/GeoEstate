@@ -327,6 +327,22 @@ CREATE TABLE IF NOT EXISTS tenancy_agreements (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Inbound leads from the GeoEstate Spatial Intelligence site (a separate
+-- geospatial consulting business line, different site entirely) - reuses
+-- this same backend/DB rather than needing its own server, matching how
+-- disputes/property submissions already work as public POST endpoints.
+CREATE TABLE IF NOT EXISTS geospatial_leads (
+  id             SERIAL PRIMARY KEY,
+  name           TEXT NOT NULL,
+  email          TEXT NOT NULL,
+  phone          TEXT,
+  organization   TEXT,
+  services       TEXT,
+  message        TEXT,
+  status         TEXT NOT NULL DEFAULT 'new',
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Individually-enrolled staff logins for the shared "GeoEstate Support"
 -- chat inbox — each row is one person's own TOTP (authenticator app)
 -- credential; a successful login against any non-revoked row here issues
