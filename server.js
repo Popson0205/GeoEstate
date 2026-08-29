@@ -174,9 +174,16 @@ function requireOwner(req, res) {
     json(res, 401, { error: 'Owner authentication required' });
     return null;
   }
-  // Token format: owner:<userId>:<timestamp>
+  // Token format: owner:<userId>:<timestamp>, with an optional trailing
+  // "s<staffId>" segment for support-staff logins (see getStaffIdFromToken)
+  // identifying which individual staff member is behind the shared
+  // SUPPORT_USER_ID identity. Stripped here first so timestamp/userId
+  // parsing below is completely unaffected either way, and every existing
+  // caller of requireOwner keeps getting back exactly the same plain
+  // userId string it always has.
   const parts = token.split(':');
   if (parts.length < 3) { json(res, 401, { error: 'Invalid token format' }); return null; }
+  if (/^s\d+$/.test(parts[parts.length - 1])) parts.pop();
   // Validate timestamp — reject tokens older than 24 hours
   const timestamp = parseInt(parts[parts.length - 1]);
   if (!timestamp || isNaN(timestamp) || Date.now() - timestamp > 24 * 60 * 60 * 1000) {
@@ -195,6 +202,20 @@ function requireOwner(req, res) {
   // just when they open that specific thread (that's what read_at means).
   db.query('UPDATE registrations SET last_active_at=NOW() WHERE id=$1', [userId]).catch(() => {});
   return userId;
+}
+
+// Support staff share one login identity (SUPPORT_USER_ID) everywhere else
+// in the backend for simplicity, but chat attribution, claims, and presence
+// need to know which individual staff member is actually behind a given
+// request. Re-parses the same token independently rather than changing
+// requireOwner's return type, so nothing that already calls requireOwner
+// needs to change.
+function getStaffIdFromToken(req) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.replace('Bearer ', '').trim();
+  const parts = token.split(':');
+  const m = /^s(\d+)$/.exec(parts[parts.length - 1]);
+  return m ? parseInt(m[1]) : null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1133,6 +1154,12 @@ async function ensureMessagesTable() {
     sender_name TEXT DEFAULT '', body TEXT NOT NULL,
     read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`).catch(() => {});
+  // Which individual support staff member actually sent this, when the
+  // sender is the shared SUPPORT_USER_ID account — null for every other
+  // message (a real owner or tenant sending as themselves has no need for
+  // this, sender_id already identifies them uniquely).
+  await db.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_staff_id INTEGER`).catch(() => {});
+  await db.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_staff_name TEXT`).catch(() => {});
 }
 
 // A "conversation" is just the (other_user, property) pair a message thread
@@ -1204,19 +1231,152 @@ async function handleGetThread(userId, otherId, propertyId, res) {
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
-async function handleSendMessage(senderId, data, res) {
+async function handleSendMessage(senderId, data, res, req) {
   try {
     await ensureMessagesTable();
     const { recipient_id, property_id, body, sender_name } = data || {};
     if (!recipient_id || !body || !body.trim()) return json(res, 400, { error: 'recipient_id and body required' });
+
+    // For support-account sends, derive the actual staff attribution from
+    // the verified login token rather than the client-supplied sender_name
+    // — a client value can't be trusted to say who's really typing, but the
+    // TOTP-verified staff id embedded at login can. Every other sender
+    // (a real owner or tenant) is unaffected — staffId is simply null.
+    let staffId = null, staffName = null;
+    if (senderId === SUPPORT_USER_ID && req) {
+      staffId = getStaffIdFromToken(req);
+      if (staffId) {
+        const staffR = await db.query('SELECT name FROM support_staff WHERE id=$1', [staffId]);
+        staffName = staffR.rows[0]?.name || null;
+      }
+    }
+
     const r = await db.query(
-      'INSERT INTO messages (property_id, sender_id, recipient_id, sender_name, body) VALUES ($1,$2,$3,$4,$5) RETURNING id, created_at',
-      [property_id || null, senderId, recipient_id, sender_name || '', body.trim()]
+      'INSERT INTO messages (property_id, sender_id, recipient_id, sender_name, body, sender_staff_id, sender_staff_name) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, created_at',
+      [property_id || null, senderId, recipient_id, sender_name || '', body.trim(), staffId, staffName]
     );
     json(res, 200, { success: true, id: r.rows[0].id, created_at: r.rows[0].created_at });
     // Best-effort, after responding to the sender — stores a real
     // notification (for the Notifications tab) and pushes, in one call.
     createNotification(recipient_id, 'chat', sender_name || 'New message', body.trim().slice(0, 100), { sender_id: senderId, property_id: property_id || '' }).catch(() => {});
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// ── Support conversation claims ──────────────────────────────────────────
+// The support inbox is shared: any staff member's login authenticates as
+// the same SUPPORT_USER_ID, so without this, two people could easily start
+// replying to the same customer at once with no way to know the other was
+// already there. A "claim" is a deliberate, visible act (not automatic on
+// first reply) — one row per customer conversation, showing who's on it.
+// Any staff member can release a claim (not just the one who made it), so
+// a claim left behind by someone who went offline doesn't lock the
+// conversation for everyone else.
+async function ensureConversationClaimsTable() {
+  await db.query(`CREATE TABLE IF NOT EXISTS conversation_claims (
+    customer_id TEXT PRIMARY KEY,
+    claimed_by_staff_id INTEGER NOT NULL,
+    claimed_by_staff_name TEXT NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`).catch(() => {});
+}
+
+async function handleClaimConversation(req, data, res) {
+  const staffId = getStaffIdFromToken(req);
+  if (!staffId) return json(res, 403, { error: 'Only individually-enrolled support staff can claim conversations' });
+  const { customerId } = data || {};
+  if (!customerId) return json(res, 400, { error: 'customerId required' });
+  try {
+    await ensureConversationClaimsTable();
+    const staffR = await db.query('SELECT name FROM support_staff WHERE id=$1 AND revoked=false', [staffId]);
+    if (!staffR.rows.length) return json(res, 403, { error: 'Staff account not found or revoked' });
+    const staffName = staffR.rows[0].name;
+    await db.query(
+      `INSERT INTO conversation_claims (customer_id, claimed_by_staff_id, claimed_by_staff_name, claimed_at)
+       VALUES ($1,$2,$3,NOW())
+       ON CONFLICT (customer_id) DO UPDATE SET claimed_by_staff_id=$2, claimed_by_staff_name=$3, claimed_at=NOW()`,
+      [customerId, staffId, staffName]
+    );
+    broadcast('support_claim_changed', { customerId, claimedBy: { staffId, staffName } });
+    json(res, 200, { success: true, claimedBy: { staffId, staffName } });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleReleaseConversation(req, data, res) {
+  const staffId = getStaffIdFromToken(req);
+  if (!staffId) return json(res, 403, { error: 'Only individually-enrolled support staff can release conversations' });
+  const { customerId } = data || {};
+  if (!customerId) return json(res, 400, { error: 'customerId required' });
+  try {
+    await ensureConversationClaimsTable();
+    await db.query('DELETE FROM conversation_claims WHERE customer_id=$1', [customerId]);
+    broadcast('support_claim_changed', { customerId, claimedBy: null });
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// Ephemeral "someone's viewing this conversation right now" presence — kept
+// entirely in the SSE broadcast itself rather than written to the
+// database, since presence has no reason to survive a server restart or be
+// queried later. Each connected support client sends one of these roughly
+// every 10s while a thread is open, and every OTHER connected client clears
+// its own "X is viewing" indicator for that conversation if no ping
+// arrives for ~20s (handled client-side — see support-app/www/js/app.js).
+async function handlePresencePing(req, data, res) {
+  const staffId = getStaffIdFromToken(req);
+  if (!staffId) return json(res, 403, { error: 'Only individually-enrolled support staff can send presence' });
+  const { customerId } = data || {};
+  if (!customerId) return json(res, 400, { error: 'customerId required' });
+  try {
+    const staffR = await db.query('SELECT name FROM support_staff WHERE id=$1', [staffId]);
+    const staffName = staffR.rows[0]?.name || 'A staff member';
+    broadcast('support_presence', { customerId, staffId, staffName, ts: Date.now() });
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// Support-inbox-specific conversation list: the same underlying data as the
+// generic handleGetConversations, but enriched with claim status and,
+// where the most recent message came from the shared support account,
+// which individual staff member actually sent it — neither of which the
+// generic customer/owner-facing endpoint has any reason to expose.
+async function handleGetSupportConversations(res) {
+  try {
+    await ensureMessagesTable();
+    await ensureConversationClaimsTable();
+    const r = await db.query(`
+      SELECT DISTINCT ON (other_id, property_id) *
+      FROM (
+        SELECT
+          CASE WHEN sender_id=$1 THEN recipient_id ELSE sender_id END as other_id,
+          property_id, body, sender_id, sender_staff_name, created_at, read_at,
+          CASE WHEN recipient_id=$1 AND read_at IS NULL THEN 1 ELSE 0 END as unread
+        FROM messages WHERE sender_id=$1 OR recipient_id=$1
+      ) t
+      ORDER BY other_id, property_id, created_at DESC
+    `, [SUPPORT_USER_ID]);
+    const claimsR = await db.query('SELECT * FROM conversation_claims');
+    const claimsByCustomer = {};
+    claimsR.rows.forEach(c => { claimsByCustomer[c.customer_id] = { staffId: c.claimed_by_staff_id, staffName: c.claimed_by_staff_name, claimedAt: c.claimed_at }; });
+
+    const rows = await Promise.all(r.rows.map(async (row) => {
+      const [nameR, propR] = await Promise.all([
+        db.query('SELECT fname, lname FROM registrations WHERE id=$1', [row.other_id]),
+        row.property_id ? db.query('SELECT title FROM properties WHERE id=$1', [row.property_id]) : Promise.resolve({ rows: [] })
+      ]);
+      const n = nameR.rows[0];
+      return {
+        other_id: row.other_id,
+        other_name: n ? (n.fname + ' ' + n.lname).trim() : 'User',
+        property_id: row.property_id,
+        property_title: propR.rows[0]?.title || '',
+        last_message: row.body, last_at: row.created_at,
+        last_message_staff_name: row.sender_id === SUPPORT_USER_ID ? (row.sender_staff_name || null) : null,
+        unread: !!row.unread,
+        claimedBy: claimsByCustomer[row.other_id] || null
+      };
+    }));
+    rows.sort((a, b) => new Date(b.last_at) - new Date(a.last_at));
+    json(res, 200, { success: true, conversations: rows });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
@@ -2019,8 +2179,12 @@ async function handleRevokeSupportStaff(id, res) {
 }
 
 // The actual login — public endpoint (this IS how a staff member logs in),
-// verified against their own enrolled secret, but issues a token for the
-// shared SUPPORT_USER_ID so the rest of the backend needs zero changes.
+// verified against their own enrolled secret, then issues a token for the
+// shared SUPPORT_USER_ID identity (so every existing chat endpoint keeps
+// working completely unchanged) plus an embedded ":s<staffId>" suffix that
+// only requireOwner and getStaffIdFromToken know to look for — this is what
+// lets claims/attribution/presence identify the individual staff member
+// behind a shared login, without touching anything else that authenticates.
 async function handleSupportStaffLogin(data, res) {
   const { email, code } = data || {};
   if (!email || !code) return json(res, 400, { error: 'email and code required' });
@@ -2035,9 +2199,9 @@ async function handleSupportStaffLogin(data, res) {
     await db.query('UPDATE support_staff SET last_login_at=NOW() WHERE id=$1', [staff.id]);
     const supportR = await db.query('SELECT * FROM registrations WHERE id=$1', [SUPPORT_USER_ID]);
     const owner = supportR.rows[0] || { id: SUPPORT_USER_ID, fname: 'GeoEstate', lname: 'Support', email: SUPPORT_EMAIL };
-    const token = 'owner:' + SUPPORT_USER_ID + ':' + Date.now();
+    const token = 'owner:' + SUPPORT_USER_ID + ':' + Date.now() + ':s' + staff.id;
     await logActivity('Support staff login: ' + staff.name).catch(() => {});
-    json(res, 200, { success: true, token, owner, staff_name: staff.name });
+    json(res, 200, { success: true, token, owner, staff_name: staff.name, staff_id: staff.id });
   } catch (e) { json(res, 500, { error: e.message }); }
 }
 
@@ -3313,6 +3477,10 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/favorites')        return handleGetFavorites(ownerId, res);
       if (url === '/owner/saved-searches')   return handleGetSavedSearches(ownerId, res);
       if (url === '/owner/conversations')    return handleGetConversations(ownerId, res);
+      if (url === '/support/conversations') {
+        if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
+        return handleGetSupportConversations(res);
+      }
       if (url.startsWith('/owner/messages')) {
         const qp = new URL('http://x' + urlFull).searchParams;
         return handleGetThread(ownerId, qp.get('with'), qp.get('property_id'), res);
@@ -3396,7 +3564,19 @@ const server = http.createServer((req, res) => {
           if (url === '/owner/saved-searches')   return handleAddSavedSearch(ownerId, data, res);
           if (url === '/owner/notifications/mark-read') return handleMarkNotificationsRead(ownerId, data, res);
           if (url === '/owner/ratings')          return handleAddRating(ownerId, data, res);
-          if (url === '/owner/messages')         return handleSendMessage(ownerId, data, res);
+          if (url === '/owner/messages')         return handleSendMessage(ownerId, data, res, req);
+          if (url === '/support/claim') {
+            if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
+            return handleClaimConversation(req, data, res);
+          }
+          if (url === '/support/release') {
+            if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
+            return handleReleaseConversation(req, data, res);
+          }
+          if (url === '/support/presence/ping') {
+            if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
+            return handlePresencePing(req, data, res);
+          }
           if (url === '/owner/push-token')       return handleRegisterPushToken(ownerId, data, res);
           const owPropMatch = url.match(/^\/owner\/property\/([^/]+)$/);
           if (owPropMatch) return handleOwnerUpdateProperty(ownerId, owPropMatch[1], data, res);

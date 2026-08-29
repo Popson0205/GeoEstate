@@ -345,9 +345,11 @@ CREATE TABLE IF NOT EXISTS geospatial_leads (
 
 -- Individually-enrolled staff logins for the shared "GeoEstate Support"
 -- chat inbox — each row is one person's own TOTP (authenticator app)
--- credential; a successful login against any non-revoked row here issues
--- a token for SUPPORT_USER_ID, so the chat/messages model itself never
--- needs to know about individual staff at all.
+-- credential. A successful login issues a token for SUPPORT_USER_ID (so
+-- every existing chat endpoint still works unchanged) plus an embedded
+-- staff id (see getStaffIdFromToken in server.js) that message
+-- attribution, conversation claims, and presence use to identify which
+-- individual staff member is actually behind a given request.
 CREATE TABLE IF NOT EXISTS support_staff (
   id                      SERIAL PRIMARY KEY,
   name                    TEXT NOT NULL,
@@ -361,6 +363,18 @@ CREATE TABLE IF NOT EXISTS support_staff (
   -- unguessable, valid for 7 days from generation.
   setup_token             TEXT,
   setup_token_expires_at  TIMESTAMPTZ
+);
+
+-- One row per customer conversation that's currently claimed by a support
+-- staff member — deliberate, not automatic on first reply, so two staff
+-- don't unknowingly reply to the same customer at once. Any staff member
+-- can release a claim (not just the one who made it), so a claim left
+-- behind by someone who went offline doesn't lock the conversation.
+CREATE TABLE IF NOT EXISTS conversation_claims (
+  customer_id             TEXT PRIMARY KEY,
+  claimed_by_staff_id     INTEGER NOT NULL,
+  claimed_by_staff_name   TEXT NOT NULL,
+  claimed_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Lets a confirmed payment be traced back to the exact unit/property it was
