@@ -1160,6 +1160,17 @@ async function ensureMessagesTable() {
   // this, sender_id already identifies them uniquely).
   await db.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_staff_id INTEGER`).catch(() => {});
   await db.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_staff_name TEXT`).catch(() => {});
+  // Edits/deletes are soft - the original body is never actually
+  // overwritten or dropped, since messages on this platform can matter
+  // for dispute resolution (see the NPF case report feature). edited_at
+  // lets the UI show an honest "(edited)" tag rather than silently
+  // rewriting history; deleted_at hides the content from both parties
+  // going forward (client responses use a placeholder, see
+  // handleGetThread) while keeping the real original_body in the
+  // database for admin/dispute review if it's ever actually needed.
+  await db.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ`).catch(() => {});
+  await db.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`).catch(() => {});
+  await db.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS original_body TEXT`).catch(() => {});
 }
 
 // A "conversation" is just the (other_user, property) pair a message thread
@@ -1224,7 +1235,14 @@ async function handleGetThread(userId, otherId, propertyId, res) {
       let status = 'sent';
       if (m.read_at) status = 'read';
       else if (otherLastActive && new Date(m.created_at) <= otherLastActive) status = 'delivered';
-      return Object.assign({}, m, { status });
+      // original_body exists only for potential admin/dispute review and
+      // must never reach either party's own chat view once a message is
+      // deleted - both sides see the same placeholder, matching how the
+      // deletion actually reads to a human ("this was taken back"), not a
+      // one-sided edit only the other person notices.
+      const { original_body, ...clean } = m;
+      if (m.deleted_at) clean.body = 'This message was deleted';
+      return Object.assign({}, clean, { status });
     });
 
     json(res, 200, { success: true, messages });
@@ -1259,6 +1277,48 @@ async function handleSendMessage(senderId, data, res, req) {
     // Best-effort, after responding to the sender — stores a real
     // notification (for the Notifications tab) and pushes, in one call.
     createNotification(recipient_id, 'chat', sender_name || 'New message', body.trim().slice(0, 100), { sender_id: senderId, property_id: property_id || '' }).catch(() => {});
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+// ── Edit / delete messages ───────────────────────────────────────────────
+// Symmetric for both ends of a conversation - a customer can edit/delete
+// their own messages, and a support-staff account can edit/delete messages
+// sent from the shared support identity (any staff member, not just
+// whoever originally typed it - they collectively own that shared inbox,
+// same reasoning as why any staff member can release someone else's
+// conversation claim). Ownership is just sender_id === callerUserId in
+// both cases, since every support login shares that one underlying id.
+async function handleEditMessage(callerUserId, messageId, data, res) {
+  const { body } = data || {};
+  if (!body || !body.trim()) return json(res, 400, { error: 'Message body required' });
+  try {
+    const r = await db.query('SELECT * FROM messages WHERE id=$1', [messageId]);
+    if (!r.rows.length) return json(res, 404, { error: 'Message not found' });
+    const msg = r.rows[0];
+    if (msg.sender_id !== callerUserId) return json(res, 403, { error: 'You can only edit your own messages' });
+    if (msg.deleted_at) return json(res, 400, { error: 'Cannot edit a deleted message' });
+    await db.query(
+      'UPDATE messages SET body=$1, edited_at=NOW(), original_body=COALESCE(original_body, $2) WHERE id=$3',
+      [body.trim(), msg.body, messageId]
+    );
+    broadcast('message_edited', { id: Number(messageId), body: body.trim(), otherId: msg.recipient_id });
+    json(res, 200, { success: true });
+  } catch(e) { json(res, 500, { error: e.message }); }
+}
+
+async function handleDeleteMessage(callerUserId, messageId, res) {
+  try {
+    const r = await db.query('SELECT * FROM messages WHERE id=$1', [messageId]);
+    if (!r.rows.length) return json(res, 404, { error: 'Message not found' });
+    const msg = r.rows[0];
+    if (msg.sender_id !== callerUserId) return json(res, 403, { error: 'You can only delete your own messages' });
+    if (msg.deleted_at) return json(res, 200, { success: true }); // already deleted - idempotent, not an error
+    await db.query(
+      'UPDATE messages SET deleted_at=NOW(), original_body=COALESCE(original_body, body) WHERE id=$1',
+      [messageId]
+    );
+    broadcast('message_deleted', { id: Number(messageId), otherId: msg.recipient_id });
+    json(res, 200, { success: true });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
 
@@ -3530,6 +3590,8 @@ const server = http.createServer((req, res) => {
       if (owFavMatch) return handleRemoveFavorite(ownerId, owFavMatch[1], res);
       const owSearchMatch = url.match(/^\/owner\/saved-searches\/(\d+)$/);
       if (owSearchMatch) return handleRemoveSavedSearch(ownerId, owSearchMatch[1], res);
+      const msgDeleteMatch = url.match(/^\/owner\/messages\/(\d+)$/);
+      if (msgDeleteMatch) return handleDeleteMessage(ownerId, msgDeleteMatch[1], res);
     }
     return json(res, 404, { error: 'Not found' });
   }
@@ -3574,6 +3636,8 @@ const server = http.createServer((req, res) => {
           if (url === '/owner/notifications/mark-read') return handleMarkNotificationsRead(ownerId, data, res);
           if (url === '/owner/ratings')          return handleAddRating(ownerId, data, res);
           if (url === '/owner/messages')         return handleSendMessage(ownerId, data, res, req);
+          const msgEditMatch = url.match(/^\/owner\/messages\/(\d+)$/);
+          if (msgEditMatch) return handleEditMessage(ownerId, msgEditMatch[1], data, res);
           if (url === '/owner/push-token')       return handleRegisterPushToken(ownerId, data, res);
           const owPropMatch = url.match(/^\/owner\/property\/([^/]+)$/);
           if (owPropMatch) return handleOwnerUpdateProperty(ownerId, owPropMatch[1], data, res);
