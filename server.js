@@ -3477,10 +3477,6 @@ const server = http.createServer((req, res) => {
       if (url === '/owner/favorites')        return handleGetFavorites(ownerId, res);
       if (url === '/owner/saved-searches')   return handleGetSavedSearches(ownerId, res);
       if (url === '/owner/conversations')    return handleGetConversations(ownerId, res);
-      if (url === '/support/conversations') {
-        if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
-        return handleGetSupportConversations(res);
-      }
       if (url.startsWith('/owner/messages')) {
         const qp = new URL('http://x' + urlFull).searchParams;
         return handleGetThread(ownerId, qp.get('with'), qp.get('property_id'), res);
@@ -3490,6 +3486,19 @@ const server = http.createServer((req, res) => {
       const unitMatch = url.match(/^\/owner\/property\/([^/]+)\/units$/);
       if (unitMatch)                         return handleGetUnits(ownerId, unitMatch[1], res);
       return json(res, 404, { error: 'Not found' });
+    }
+
+    // Support-staff routes (also token-gated, but /support/ doesn't match
+    // the /owner/ prefix above, so these need their own requireOwner call -
+    // nesting them inside the /owner/ block above was the actual bug here:
+    // that block's outer `if` never matches a /support/ URL at all, so
+    // anything placed inside it is silently unreachable, not just
+    // unauthenticated.
+    if (url === '/support/conversations') {
+      const ownerId = requireOwner(req, res);
+      if (!ownerId) return;
+      if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
+      return handleGetSupportConversations(res);
     }
 
     return json(res, 404, { error: 'Not found' });
@@ -3565,18 +3574,6 @@ const server = http.createServer((req, res) => {
           if (url === '/owner/notifications/mark-read') return handleMarkNotificationsRead(ownerId, data, res);
           if (url === '/owner/ratings')          return handleAddRating(ownerId, data, res);
           if (url === '/owner/messages')         return handleSendMessage(ownerId, data, res, req);
-          if (url === '/support/claim') {
-            if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
-            return handleClaimConversation(req, data, res);
-          }
-          if (url === '/support/release') {
-            if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
-            return handleReleaseConversation(req, data, res);
-          }
-          if (url === '/support/presence/ping') {
-            if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
-            return handlePresencePing(req, data, res);
-          }
           if (url === '/owner/push-token')       return handleRegisterPushToken(ownerId, data, res);
           const owPropMatch = url.match(/^\/owner\/property\/([^/]+)$/);
           if (owPropMatch) return handleOwnerUpdateProperty(ownerId, owPropMatch[1], data, res);
@@ -3589,6 +3586,22 @@ const server = http.createServer((req, res) => {
           const owUnitPatch = url.match(/^\/owner\/property\/([^/]+)\/units\/(\d+)$/);
           if (owUnitPatch) return handleUpdateUnit(ownerId, owUnitPatch[1], owUnitPatch[2], data, res);
           return json(res, 404, { error: 'Not found' });
+        }
+
+        // Support-staff routes (also token-gated, but /support/ doesn't
+        // match the /owner/ prefix above, so these need their own
+        // requireOwner call - nesting them inside the /owner/ block above
+        // was the actual bug: that block's outer `if` never matches a
+        // /support/ URL at all, so anything placed inside it is silently
+        // unreachable, not just unauthenticated. Same mistake, same fix,
+        // as the GET /support/conversations route above.
+        if (url === '/support/claim' || url === '/support/release' || url === '/support/presence/ping') {
+          const ownerId = requireOwner(req, res);
+          if (!ownerId) return;
+          if (ownerId !== SUPPORT_USER_ID) return json(res, 403, { error: 'Support staff only' });
+          if (url === '/support/claim')          return handleClaimConversation(req, data, res);
+          if (url === '/support/release')        return handleReleaseConversation(req, data, res);
+          if (url === '/support/presence/ping')  return handlePresencePing(req, data, res);
         }
 
         // Admin routes (token required)
