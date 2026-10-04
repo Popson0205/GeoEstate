@@ -82,14 +82,97 @@ function jwtSign(payload, secret, expiresInHours = 8) {
 }
 function jwtVerify(token, secret) {
   try {
-    const [header, body, sig] = token.split('.');
+    const parts = String(token).split('.');
+    if (parts.length !== 3) return null;
+    const [header, body, sig] = parts;
     const expected = b64url(crypto.createHmac('sha256', secret).update(header + '.' + body).digest());
-    if (sig !== expected) return null;
+    const a = Buffer.from(sig), b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;   // constant-time
     const payload = JSON.parse(Buffer.from(body, 'base64').toString());
-    if (payload.exp < Math.floor(Date.now()/1000)) return null; // expired
+    if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now()/1000)) return null; // missing/expired
     return payload;
   } catch(e) { return null; }
 }
+
+// ── Security helpers ─────────────────────────────────────────────────────────
+// Session tokens, email-verification proofs and password hashes all live here.
+//  * Session tokens are signed (HMAC-SHA256) and expire after 24h. They used to
+//    be the bare string "owner:<id>:<timestamp>", which anyone could forge.
+//  * Each token type uses its own key derived from JWT_SECRET, so a token of one
+//    kind can never be replayed as another (e.g. an email proof as a session).
+//  * Passwords are stored as salted scrypt hashes (Node built-in, no deps).
+const ALLOW_DEV_OTP       = process.env.ALLOW_DEV_OTP === 'true';        // NEVER enable in production
+const ENFORCE_EMAIL_PROOF = process.env.ENFORCE_EMAIL_PROOF !== 'false'; // set 'false' only as a temporary rollback
+const OWNER_TOKEN_SECRET  = crypto.createHmac('sha256', JWT_SECRET).update('geoestate/owner-session/v1').digest('hex');
+const EMAIL_PROOF_SECRET  = crypto.createHmac('sha256', JWT_SECRET).update('geoestate/email-proof/v1').digest('hex');
+
+function makeOwnerToken(userId, staffId) {
+  const claims = { aud: 'owner', sub: String(userId) };
+  if (staffId !== undefined && staffId !== null) claims.sid = parseInt(staffId, 10);
+  return jwtSign(claims, OWNER_TOKEN_SECRET, 24);
+}
+function parseOwnerToken(token) {
+  const p = jwtVerify(token, OWNER_TOKEN_SECRET);
+  if (!p || p.aud !== 'owner' || !p.sub) return null;
+  return p;
+}
+function makeEmailProof(email) {            // proves the caller just passed an emailed OTP for this address
+  return jwtSign({ aud: 'email-proof', sub: String(email).toLowerCase().trim() }, EMAIL_PROOF_SECRET, 0.5);
+}
+function checkEmailProof(token, email) {
+  const p = jwtVerify(String(token || ''), EMAIL_PROOF_SECRET);
+  return !!(p && p.aud === 'email-proof' && p.sub === String(email).toLowerCase().trim());
+}
+
+function tsEqual(a, b) {                    // constant-time string compare (safe for different lengths)
+  const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) { crypto.timingSafeEqual(ba, ba); return false; }
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 };
+function scryptAsync(pw, salt, keylen, opts) {
+  return new Promise((resolve, reject) => crypto.scrypt(pw, salt, keylen, opts, (e, k) => e ? reject(e) : resolve(k)));
+}
+async function hashPassword(plain) {
+  const salt = crypto.randomBytes(16);
+  const dk = await scryptAsync(String(plain), salt, SCRYPT.keylen, { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p });
+  return ['scrypt', SCRYPT.N, SCRYPT.r, SCRYPT.p, salt.toString('base64'), dk.toString('base64')].join('$');
+}
+// Returns { ok, upgrade }. `upgrade` = matched an old base64 "hash" and should be re-saved as scrypt.
+async function verifyPassword(plain, stored) {
+  if (!stored) return { ok: false, upgrade: false };
+  if (stored.startsWith('scrypt$')) {
+    const [, n, r, p, saltB64, hashB64] = stored.split('$');
+    const expected = Buffer.from(hashB64, 'base64');
+    const dk = await scryptAsync(String(plain), Buffer.from(saltB64, 'base64'), expected.length, { N: +n, r: +r, p: +p });
+    return { ok: dk.length === expected.length && crypto.timingSafeEqual(dk, expected), upgrade: false };
+  }
+  const ok = tsEqual(Buffer.from(String(plain)).toString('base64'), stored);   // legacy: base64(password)
+  return { ok, upgrade: ok };
+}
+function passwordPolicyError(pw) {
+  if (typeof pw !== 'string' || pw.length < 8) return 'Password must be at least 8 characters.';
+  if (pw.length > 128) return 'Password is too long (max 128 characters).';
+  return null;
+}
+
+// Simple in-memory rate limiter (per process). Enough to stop OTP/password guessing.
+const _rl = new Map();
+function rateLimited(key, max, windowMs) {
+  const now = Date.now();
+  let e = _rl.get(key);
+  if (!e || now > e.reset) { e = { n: 0, reset: now + windowMs }; _rl.set(key, e); }
+  e.n++;
+  return e.n > max;
+}
+setInterval(() => { const n = Date.now(); for (const [k, e] of _rl) if (n > e.reset) _rl.delete(k); }, 60 * 1000).unref();
+function clientIp(req) {
+  if (!req) return 'unknown';
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xff || (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+const TOO_MANY = 'Too many attempts. Please wait a few minutes and try again.';
 
 // ── Sales Team Config ──────────────────────────────────────────────────────
 const SALES_TEAM = [
@@ -169,32 +252,13 @@ function requireAdmin(req, res) {
 
 function requireOwner(req, res) {
   const auth = req.headers['authorization'] || '';
-  const token = auth.replace('Bearer ', '').trim();
-  if (!token || !token.startsWith('owner:')) {
-    json(res, 401, { error: 'Owner authentication required' });
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  const claims = token ? parseOwnerToken(token) : null;   // signature + 24h expiry checked here
+  if (!claims) {
+    json(res, 401, { error: 'Session expired or invalid. Please sign in again.' });
     return null;
   }
-  // Token format: owner:<userId>:<timestamp>, with an optional trailing
-  // "s<staffId>" segment for support-staff logins (see getStaffIdFromToken)
-  // identifying which individual staff member is behind the shared
-  // SUPPORT_USER_ID identity. Stripped here first so timestamp/userId
-  // parsing below is completely unaffected either way, and every existing
-  // caller of requireOwner keeps getting back exactly the same plain
-  // userId string it always has.
-  const parts = token.split(':');
-  if (parts.length < 3) { json(res, 401, { error: 'Invalid token format' }); return null; }
-  if (/^s\d+$/.test(parts[parts.length - 1])) parts.pop();
-  // Validate timestamp — reject tokens older than 24 hours
-  const timestamp = parseInt(parts[parts.length - 1]);
-  if (!timestamp || isNaN(timestamp) || Date.now() - timestamp > 24 * 60 * 60 * 1000) {
-    json(res, 401, { error: 'Token expired. Please log in again.' });
-    return null;
-  }
-  // parts[0]='owner', parts[last]=timestamp, middle = userId
-  parts.shift(); // remove 'owner'
-  parts.pop();   // remove timestamp
-  const userId = parts.join(':');
-  if (!userId || userId.length < 3) { json(res, 401, { error: 'Invalid token' }); return null; }
+  const userId = claims.sub;
   // Fire-and-forget (requireOwner is called synchronously everywhere, so
   // this can't be awaited without touching every call site) — powers the
   // "delivered" chat status: a message counts as delivered once the
@@ -212,15 +276,13 @@ function requireOwner(req, res) {
 // needs to change.
 function getStaffIdFromToken(req) {
   const auth = req.headers['authorization'] || '';
-  const token = auth.replace('Bearer ', '').trim();
-  const parts = token.split(':');
-  const m = /^s(\d+)$/.exec(parts[parts.length - 1]);
-  return m ? parseInt(m[1]) : null;
+  const claims = parseOwnerToken(auth.replace(/^Bearer\s+/i, '').trim());
+  return claims && Number.isInteger(claims.sid) ? claims.sid : null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return crypto.randomInt(100000, 1000000).toString();   // cryptographically secure
 }
 
 function json(res, code, data) {
@@ -246,11 +308,14 @@ function sendEmail(to, subject, html) {
     }, res => {
       let d = ''; res.on('data', c => d += c);
       res.on('end', () => {
-        const p = JSON.parse(d);
+        let p = {};
+        try { p = JSON.parse(d); } catch (e) { /* non-JSON error body */ }
         if (res.statusCode === 200 || res.statusCode === 201) resolve(p);
-        else reject(new Error(p.message || 'Send failed'));
+        else reject(new Error(p.message || ('Send failed (HTTP ' + res.statusCode + ')')));
       });
     });
+    // Never let a slow/unreachable email provider hang the request forever.
+    req.setTimeout(15000, () => req.destroy(new Error('Email provider timed out')));
     req.on('error', reject); req.write(body); req.end();
   });
 }
@@ -477,60 +542,77 @@ async function logActivity(msg) {
 // PHASE 1 — ROUTE HANDLERS
 // ══════════════════════════════════════════════════════════════
 
-async function handleSendOTP(data, res) {
-  const { email, name, purpose } = data;
-  if (!email || !email.includes('@')) return json(res, 400, { error: 'Valid email required' });
+async function handleSendOTP(data, res, req) {
+  const { email, name, purpose } = data || {};
+  if (!email || typeof email !== 'string' || !email.includes('@')) return json(res, 400, { error: 'Valid email required' });
+  const emailKey = email.toLowerCase().trim();
+  if (rateLimited('otp-send:e:' + emailKey, 5, 15 * 60 * 1000) || rateLimited('otp-send:ip:' + clientIp(req), 30, 60 * 60 * 1000)) {
+    return json(res, 429, { error: 'Too many code requests. Please wait a few minutes and try again.' });
+  }
+
+  // Password reset: only email a code if the account exists, but ALWAYS answer the
+  // same way so this can't be used to discover which emails are registered.
+  if (purpose === 'reset') {
+    try {
+      const r = await db.query('SELECT fname FROM registrations WHERE email = $1', [emailKey]);
+      if (r.rows.length) {
+        const code = generateOTP();
+        await otpSet('reset:' + emailKey, code, 10 * 60 * 1000);
+        await sendEmail(emailKey, 'GeoEstate — Password reset code: ' + code, otpEmail(code, r.rows[0].fname || '', 'reset'))
+          .catch(e => console.warn('Reset email failed:', e.message));
+      }
+    } catch (e) { console.error('Reset OTP error:', e.message); }
+    return json(res, 200, { success: true, message: 'If an account exists for that email, a code has been sent.' });
+  }
+
   const code = generateOTP();
 
   // Step 1: Save OTP to DB — this MUST happen regardless of email outcome
   try {
-    await otpSet(email.toLowerCase(), code, 10 * 60 * 1000);
+    await otpSet(emailKey, code, 10 * 60 * 1000);
   } catch(dbErr) {
     console.error('OTP DB save failed:', dbErr.message);
     return json(res, 500, { error: 'Could not save verification code. Please try again.' });
   }
 
-  // Step 2: Send email — non-fatal. If Resend isn't configured or domain unverified,
-  // return devCode so the user/developer can complete verification without email.
-  const hasResend = !!RESEND_API_KEY;
-  if (!hasResend) {
-    console.warn('SECRET_RESEND_API_KEY not set — returning devCode for testing');
-    return json(res, 200, { success: true, message: 'Code generated (no email key)', testMode: true, devCode: code });
+  // Step 2: Send the email. The code is only ever returned in the response when
+  // ALLOW_DEV_OTP=true (local testing). In production a failed send is an error —
+  // returning the code to the caller would let anyone verify an email they don't own.
+  if (!RESEND_API_KEY) {
+    console.error('SECRET_RESEND_API_KEY not set — cannot send verification emails');
+    if (ALLOW_DEV_OTP) return json(res, 200, { success: true, message: 'Code generated (no email key)', testMode: true, devCode: code });
+    return json(res, 503, { error: 'Email service is temporarily unavailable. Please try again shortly.' });
   }
-
   try {
     await sendEmail(email, 'GeoEstate — Your Code: ' + code, otpEmail(code, name || '', purpose || 'register'));
     json(res, 200, { success: true, message: 'Code sent to ' + email });
   } catch(emailErr) {
-    // Email failed (unverified domain, bounce, etc.) — code is in DB, surface devCode
-    console.warn('Email send failed:', emailErr.message, '— returning devCode fallback');
-    json(res, 200, {
-      success: true,
-      message: 'Email delivery issue — use code below',
-      testMode: true,
-      devCode: code,
-      emailError: emailErr.message
-    });
+    console.warn('Email send failed:', emailErr.message);
+    if (ALLOW_DEV_OTP) return json(res, 200, { success: true, message: 'Email delivery issue — use code below', testMode: true, devCode: code, emailError: emailErr.message });
+    json(res, 502, { error: 'We could not send the verification email. Please check the address and try again.' });
   }
 }
 
-async function handleVerifyOTP(data, res) {
-  const { email, code } = data;
+async function handleVerifyOTP(data, res, req) {
+  const { email, code } = data || {};
   if (!email || !code) return json(res, 400, { error: 'Email and code required' });
+  if (rateLimited('otp-verify:ip:' + clientIp(req), 60, 15 * 60 * 1000)) return json(res, 429, { error: TOO_MANY });
   try {
-    const key = email.toLowerCase();
+    const key = String(email).toLowerCase().trim();
     const record = await otpGet(key);
     if (!record) return json(res, 400, { error: 'No code found. Request a new one.' });
     if (Date.now() > record.expires) { await otpDelete(key); return json(res, 400, { error: 'Code expired.' }); }
-    if (record.attempts > 5) { await otpDelete(key); return json(res, 429, { error: 'Too many attempts. Request a new code.' }); }
-    if (code !== record.code) {
+    if (record.attempts >= 5) { await otpDelete(key); return json(res, 429, { error: 'Too many attempts. Request a new code.' }); }
+    if (!tsEqual(String(code).trim(), record.code)) {
       await otpIncrementAttempts(key);
-      return json(res, 400, { error: 'Incorrect code. ' + (5 - record.attempts - 1) + ' attempt(s) remaining.' });
+      return json(res, 400, { error: 'Incorrect code. ' + Math.max(0, 5 - record.attempts - 1) + ' attempt(s) remaining.' });
     }
     await otpDelete(key);
-    json(res, 200, { success: true, message: 'Email verified' });
+    // verifyToken = short-lived proof that this caller controls the mailbox. /register requires it.
+    json(res, 200, { success: true, message: 'Email verified', verifyToken: makeEmailProof(key) });
   } catch(e) {
-    json(res, 500, { error: e.message });
+    console.error('Verify OTP error:', e.message);
+    json(res, 500, { error: 'Verification failed. Please try again.' });
   }
 }
 
@@ -539,40 +621,42 @@ async function handleVerifyOTP(data, res) {
 // Validates email + password against registrations table in Neon.
 // Password is stored as base64(password) in the reg payload (same as frontend btoa).
 // Returns the user record on success.
-async function handleUserLogin(data, res) {
-  const { email, password } = data;
-  if (!email || !password) return json(res, 400, { error: 'Email and password required' });
+async function handleUserLogin(data, res, req) {
+  const { email, password } = data || {};
+  if (!email || !password || typeof email !== 'string' || typeof password !== 'string') return json(res, 400, { error: 'Email and password required' });
+  const emailKey = email.toLowerCase().trim();
+  const ip = clientIp(req);
+  if (rateLimited('login:' + ip + ':' + emailKey, 8, 15 * 60 * 1000) || rateLimited('login:ip:' + ip, 60, 15 * 60 * 1000)) {
+    return json(res, 429, { error: TOO_MANY });
+  }
   try {
     const r = await db.query(
       'SELECT id, fname, lname, email, phone, role, status, is_verified, pass_hash, photo_url FROM registrations WHERE email = $1',
-      [email.toLowerCase().trim()]
+      [emailKey]
     );
     if (!r.rows.length) return json(res, 401, { error: 'No account found with this email. Please register first.' });
     const user = r.rows[0];
-    // Password stored as btoa(password) by frontend — compare base64
-    const expected = Buffer.from(password).toString('base64');
-    if (user.pass_hash) {
-      if (user.pass_hash !== expected) {
-        return json(res, 401, { error: 'Incorrect password. Please try again.' });
-      }
-    } else {
-      // No password stored yet — accept login and save hash for next time
-      await db.query(
-        'UPDATE registrations SET pass_hash = $1, updated_at = NOW() WHERE id = $2',
-        [expected, user.id]
-      ).catch(e => console.warn('pass_hash update failed:', e.message));
+
+    // An account with NO stored password can no longer be claimed by whoever logs in first.
+    // The owner proves they control the mailbox via the emailed code (Forgot password).
+    if (!user.pass_hash) {
+      return json(res, 403, {
+        error: 'This account has no password yet. Tap "Forgot password?" to set one with a code sent to your email.',
+        needsPassword: true
+      });
     }
-    // Issue the same owner:<id>:<timestamp> token the /owner/* endpoints and
-    // the owner-dashboard's OTP login already use. Without this, the frontend's
-    // "bridge straight into an owner session on regular login" logic
-    // (GeoAPI.setOwnerSession, wired up in doLogin()) has nothing to store —
-    // data.token is always undefined — so every customer login silently fails
-    // to skip the owner dashboard's separate OTP screen, even after a
-    // successful password login.
-    const token = 'owner:' + user.id + ':' + Date.now();
+
+    const v = await verifyPassword(password, user.pass_hash);
+    if (!v.ok) return json(res, 401, { error: 'Incorrect password. Please try again.' });
+    if (v.upgrade) {
+      // Matched an old base64 value — quietly re-save it as a salted scrypt hash.
+      hashPassword(password)
+        .then(h => db.query('UPDATE registrations SET pass_hash = $1, updated_at = NOW() WHERE id = $2', [h, user.id]))
+        .catch(e => console.warn('pass_hash upgrade failed:', e.message));
+    }
     json(res, 200, {
       success: true,
-      token,
+      token: makeOwnerToken(user.id),
       user: {
         id:       user.id,
         fname:    user.fname,
@@ -590,34 +674,70 @@ async function handleUserLogin(data, res) {
   }
 }
 
-async function handleRegister(data, res) {
+// ── Reset password — POST /user/reset-password {email, code, password} ───────
+// Requires the code emailed by /send-otp {purpose:'reset'}. This is also how an
+// account that never had a password gets one.
+async function handleResetPassword(data, res, req) {
+  const { email, code, password } = data || {};
+  if (!email || !code || !password || typeof password !== 'string') return json(res, 400, { error: 'Email, code and new password are required' });
+  const pwErr = passwordPolicyError(password);
+  if (pwErr) return json(res, 400, { error: pwErr });
+  if (rateLimited('reset:ip:' + clientIp(req), 20, 15 * 60 * 1000)) return json(res, 429, { error: TOO_MANY });
+  const emailKey = String(email).toLowerCase().trim();
+  const key = 'reset:' + emailKey;
+  try {
+    const record = await otpGet(key);
+    if (!record) return json(res, 400, { error: 'No active code. Please request a new one.' });
+    if (Date.now() > record.expires) { await otpDelete(key); return json(res, 400, { error: 'Code expired. Please request a new one.' }); }
+    if (record.attempts >= 5) { await otpDelete(key); return json(res, 429, { error: 'Too many attempts. Please request a new code.' }); }
+    if (!tsEqual(String(code).trim(), record.code)) {
+      await otpIncrementAttempts(key);
+      return json(res, 400, { error: 'Incorrect code. ' + Math.max(0, 5 - record.attempts - 1) + ' attempt(s) remaining.' });
+    }
+    await otpDelete(key);
+    const hash = await hashPassword(password);
+    const u = await db.query('UPDATE registrations SET pass_hash = $1, updated_at = NOW() WHERE email = $2 RETURNING id', [hash, emailKey]);
+    if (!u.rows.length) return json(res, 404, { error: 'Account not found.' });
+    await logActivity('Password reset: ' + emailKey).catch(() => {});
+    json(res, 200, { success: true, message: 'Password updated. You can now sign in.' });
+  } catch(e) {
+    console.error('Reset password error:', e.message);
+    json(res, 500, { error: 'Could not reset password. Please try again.' });
+  }
+}
+
+async function handleRegister(data, res, req) {
   const { fname, lname, email, phone, role, id, registeredAt } = data;
   if (!email || !fname) return json(res, 400, { error: 'Name and email required' });
-  // pass is sent as btoa(password) from frontend doRegister()
-  const pass_hash = data.pass || null;
+  if (rateLimited('register:ip:' + clientIp(req), 20, 60 * 60 * 1000)) return json(res, 429, { error: TOO_MANY });
+  // Registration requires proof the caller passed the emailed OTP for THIS address
+  // (the verifyToken returned by /verify-otp). Without it anyone could register — or
+  // claim — any email address without owning it.
+  if (ENFORCE_EMAIL_PROOF && !checkEmailProof(data.verifyToken, email)) {
+    return json(res, 403, { error: 'Email not verified. Please verify your email with the code we send, then try again.' });
+  }
+  // pass is sent as btoa(password) from the frontend; decode it and store only a salted scrypt hash.
+  let pass_hash = null;
+  {
+    const plain = data.pass ? Buffer.from(String(data.pass), 'base64').toString('utf8')
+                : (typeof data.password === 'string' ? data.password : '');
+    if (plain) {
+      const pwErr = passwordPolicyError(plain);
+      if (pwErr) return json(res, 400, { error: pwErr });
+      pass_hash = await hashPassword(plain);
+    }
+  }
   const { dob, gender, occupation, employer, state: regState, lga: regLga, address: regAddress, next_of_kin, next_of_kin_rel, next_of_kin_phone, nin } = data; // FIX 2: added nin
   try {
     const exists = await db.query('SELECT id, is_verified FROM registrations WHERE email = $1', [email.toLowerCase()]);
     if (exists.rows.length) {
-      // Was returning {success:true} with NO submissionId at all. The
-      // frontend's sessionUser.id = regData.submissionId || ('USR-'+Date.now())
-      // fallback then generated a brand-new ID matching no real row in the
-      // DB. Every action after that — most importantly identity verification
-      // (selfie/ID doc upload) — silently targeted a nonexistent row: the
-      // UPDATE matched zero rows (not a SQL error), so the frontend reported
-      // success while nothing was ever actually saved against the person's
-      // real registration. This is very likely what happened for anyone
-      // whose files "definitely uploaded" but never appeared in admin. Now
-      // returns the real existing ID so a repeat signup attempt (closed the
-      // app mid-OTP, tried again, etc. — an easy thing to do) still lets
-      // them log in and continue against their actual record.
-      const ownerToken = 'owner:' + exists.rows[0].id + ':' + Date.now();
-      return json(res, 200, {
-        success: true, message: 'Already registered', submissionId: exists.rows[0].id,
-        token: ownerToken, alreadyVerified: !!exists.rows[0].is_verified
-      });
+      // Never hand out a session for an account that already exists: the caller has not
+      // proven they are its owner (they only proved they can receive an email). They
+      // must sign in — or use "Forgot password" if they never set a password.
+      return json(res, 409, { error: 'An account with this email already exists. Please sign in instead.' });
     }
-    const subId = id || ('USR-' + Date.now());
+    // IDs are always server-generated; a client-supplied id could collide with (or spoof) another account.
+    const subId = 'USR-' + Date.now() + '-' + crypto.randomBytes(3).toString('hex');
     // Try full insert with all extended fields, fall back to minimal
     try {
       const { photo_url, id_doc_url, other_doc_url } = data;
@@ -646,11 +766,7 @@ async function handleRegister(data, res) {
     await logActivity('New registration: ' + fname + ' ' + lname + ' (' + (role==='owner'?'Owner':'Renter') + ')');
     sendEmail('admin@geoestate.com.ng', '🆕 New Registration: ' + fname + ' ' + lname, adminAlertEmail({fname,lname,email,phone,role,id:subId}))
       .catch(e => console.warn('Admin alert failed:', e.message));
-    // Same gap as /user/login: without this token the frontend's
-    // GeoAPI.setOwnerSession() call after registration has nothing to store,
-    // so a brand-new account still hits the owner dashboard's separate OTP
-    // screen the first time they try to list a property.
-    const token = 'owner:' + subId + ':' + Date.now();
+    const token = makeOwnerToken(subId);
     json(res, 200, { success: true, submissionId: subId, token });
   } catch(e) {
     console.error('Register error:', e.message);
@@ -2245,9 +2361,10 @@ async function handleRevokeSupportStaff(id, res) {
 // only requireOwner and getStaffIdFromToken know to look for — this is what
 // lets claims/attribution/presence identify the individual staff member
 // behind a shared login, without touching anything else that authenticates.
-async function handleSupportStaffLogin(data, res) {
+async function handleSupportStaffLogin(data, res, req) {
   const { email, code } = data || {};
   if (!email || !code) return json(res, 400, { error: 'email and code required' });
+  if (rateLimited('support-login:' + clientIp(req) + ':' + String(email).toLowerCase().trim(), 8, 15 * 60 * 1000)) return json(res, 429, { error: TOO_MANY });
   try {
     await ensureSupportStaffTable();
     const r = await db.query('SELECT * FROM support_staff WHERE email=$1 AND revoked=false', [email.trim().toLowerCase()]);
@@ -2259,7 +2376,7 @@ async function handleSupportStaffLogin(data, res) {
     await db.query('UPDATE support_staff SET last_login_at=NOW() WHERE id=$1', [staff.id]);
     const supportR = await db.query('SELECT * FROM registrations WHERE id=$1', [SUPPORT_USER_ID]);
     const owner = supportR.rows[0] || { id: SUPPORT_USER_ID, fname: 'GeoEstate', lname: 'Support', email: SUPPORT_EMAIL };
-    const token = 'owner:' + SUPPORT_USER_ID + ':' + Date.now() + ':s' + staff.id;
+    const token = makeOwnerToken(SUPPORT_USER_ID, staff.id);
     await logActivity('Support staff login: ' + staff.name).catch(() => {});
     json(res, 200, { success: true, token, owner, staff_name: staff.name, staff_id: staff.id });
   } catch (e) { json(res, 500, { error: e.message }); }
@@ -2707,32 +2824,44 @@ async function handleSaveTransaction(data, res) {
 // PHASE 2 — OWNER LAYER
 // ══════════════════════════════════════════════════════════════
 
-async function handleOwnerLogin(data, res) {
-  const { email, code } = data;
-  if (!email) return json(res, 400, { error: 'Email required' });
-  const key = 'owner:' + email.toLowerCase();
+async function handleOwnerLogin(data, res, req) {
+  const { email, code } = data || {};
+  if (!email || typeof email !== 'string') return json(res, 400, { error: 'Email required' });
+  const emailKey = email.toLowerCase().trim();
+  const key = 'owner:' + emailKey;
 
   // If just requesting OTP
   if (!code) {
+    if (rateLimited('owner-otp:e:' + emailKey, 5, 15 * 60 * 1000) || rateLimited('owner-otp:ip:' + clientIp(req), 30, 60 * 60 * 1000)) {
+      return json(res, 429, { error: 'Too many code requests. Please wait a few minutes and try again.' });
+    }
     const otpCode = generateOTP();
     try {
       await otpSet(key, otpCode, 10 * 60 * 1000);
       await sendEmail(email, 'GeoEstate Owner Login — Code: ' + otpCode, otpEmail(otpCode, '', 'owner-login'));
       return json(res, 200, { success: true, message: 'Code sent' });
-    } catch(e) { return json(res, 500, { error: e.message }); }
+    } catch(e) {
+      console.error('Owner OTP send failed:', e.message);
+      return json(res, 502, { error: 'We could not send the code. Please try again shortly.' });
+    }
   }
 
   // Verify OTP
+  if (rateLimited('owner-verify:ip:' + clientIp(req), 60, 15 * 60 * 1000)) return json(res, 429, { error: TOO_MANY });
   let record;
-  try { record = await otpGet(key); } catch(e) { return json(res, 500, { error: e.message }); }
+  try { record = await otpGet(key); } catch(e) { return json(res, 500, { error: 'Login failed. Please try again.' }); }
   if (!record) return json(res, 400, { error: 'No code found. Request a new one.' });
   if (Date.now() > record.expires) { await otpDelete(key); return json(res, 400, { error: 'Code expired.' }); }
-  if (code !== record.code) { await otpIncrementAttempts(key); return json(res, 400, { error: 'Incorrect code.' }); }
+  if (record.attempts >= 5) { await otpDelete(key); return json(res, 429, { error: 'Too many attempts. Request a new code.' }); }
+  if (!tsEqual(String(code).trim(), record.code)) {
+    await otpIncrementAttempts(key);
+    return json(res, 400, { error: 'Incorrect code.' });
+  }
   await otpDelete(key);
 
   // Find user — accept any registered email, owner role not strictly required
   try {
-    const r = await db.query('SELECT * FROM registrations WHERE email=$1', [email.toLowerCase()]);
+    const r = await db.query('SELECT * FROM registrations WHERE email=$1', [emailKey]);
     if (!r.rows.length) return json(res, 404, {
       error: 'No account found for this email. Please register on the website first.',
       hint: 'Visit geoestate.com.ng and complete the registration form before logging in here.'
@@ -2743,17 +2872,16 @@ async function handleOwnerLogin(data, res) {
       await db.query("UPDATE registrations SET role='owner', type='owner', updated_at=NOW() WHERE id=$1", [u.id]);
       u.role = 'owner';
     }
-    const token = 'owner:' + u.id + ':' + Date.now();
     json(res, 200, {
       success: true,
-      token,
+      token: makeOwnerToken(u.id),
       owner: {
         id: u.id, fname: u.fname, lname: u.lname, email: u.email,
         phone: u.phone, is_verified: u.is_verified || false, owner_since: u.owner_since,
         status: u.status, role: u.role
       }
     });
-  } catch(e) { json(res, 500, { error: e.message }); }
+  } catch(e) { console.error('Owner login error:', e.message); json(res, 500, { error: 'Login failed. Please try again.' }); }
 }
 
 // ── Partner Login — POST /partner/login ──────────────────────────────────────
@@ -2762,11 +2890,12 @@ async function handleOwnerLogin(data, res) {
 // understand, but with a stable per-partner pseudo-id (PARTNER-<slug>) instead
 // of a real registrations.id — so a partner's properties (owner_id = that
 // pseudo-id) can never collide with, or be confused for, a real owner's.
-async function handlePartnerLogin(data, res) {
-  const { name, token } = data;
+async function handlePartnerLogin(data, res, req) {
+  const { name, token } = data || {};
   if (!name || !token) return json(res, 400, { error: 'Name and access token are required.' });
+  if (rateLimited('partner-login:' + clientIp(req), 10, 15 * 60 * 1000)) return json(res, 429, { error: TOO_MANY });
   const partner = PARTNERS.find(p => p.name === name);
-  if (!partner || partner.token !== token) {
+  if (!partner || !tsEqual(String(partner.token), String(token))) {
     return json(res, 401, { error: 'Invalid name or access token.' });
   }
   const partnerId = partnerSlug(name);
@@ -2786,7 +2915,7 @@ async function handlePartnerLogin(data, res) {
     );
   } catch(e) { console.warn('Partner registrations row ensure failed:', e.message); }
 
-  const ownerToken = 'owner:' + partnerId + ':' + Date.now();
+  const ownerToken = makeOwnerToken(partnerId);
   json(res, 200, {
     success: true,
     token: ownerToken,
@@ -3605,13 +3734,14 @@ const server = http.createServer((req, res) => {
         const data = body ? JSON.parse(body) : {};
 
         // Public endpoints
-        if (url === '/admin/login')            return handleAdminLogin(data, res);
+        if (url === '/admin/login')            return handleAdminLogin(data, res, req);
         if (url === '/admin/logout')           return handleAdminLogout(req, res);
         if (url === '/admin/refresh')          return handleAdminRefresh(req, res);
-        if (url === '/send-otp')             return handleSendOTP(data, res);
-        if (url === '/verify-otp')           return handleVerifyOTP(data, res);
-        if (url === '/register')             return handleRegister(data, res);
-        if (url === '/user/login')            return handleUserLogin(data, res);
+        if (url === '/send-otp')             return handleSendOTP(data, res, req);
+        if (url === '/verify-otp')           return handleVerifyOTP(data, res, req);
+        if (url === '/register')             return handleRegister(data, res, req);
+        if (url === '/user/login')            return handleUserLogin(data, res, req);
+    if (url === '/user/reset-password')   return handleResetPassword(data, res, req);
         if (url === '/enquiry')              return handleEnquiry(data, res);
         const viewMatch = url.match(/^\/properties\/([^/]+)\/view$/);
         if (viewMatch) return handleRecordPropertyView(viewMatch[1], res);
@@ -3621,9 +3751,9 @@ const server = http.createServer((req, res) => {
         if (url === '/geospatial-leads')     return handleGeospatialLead(data, res);
 
         // Owner auth (no token needed)
-        if (url === '/owner/login')          return handleOwnerLogin(data, res);
-        if (url === '/partner/login')        return handlePartnerLogin(data, res);
-        if (url === '/support/login')        return handleSupportStaffLogin(data, res);
+        if (url === '/owner/login')          return handleOwnerLogin(data, res, req);
+        if (url === '/partner/login')        return handlePartnerLogin(data, res, req);
+        if (url === '/support/login')        return handleSupportStaffLogin(data, res, req);
 
         // Owner routes (token required)
         if (url.startsWith('/owner/')) {
@@ -3784,7 +3914,8 @@ async function handleSupabaseUploadSign(data, res) {
 // ── Admin Login — POST /admin/login ──────────────────────────────────────────
 // Validates ADMIN_EMAIL + ADMIN_PASSWORD env vars, returns a signed JWT.
 // The raw password/secret NEVER leaves the server.
-async function handleAdminLogin(data, res) {
+async function handleAdminLogin(data, res, req) {
+  if (rateLimited('admin-login:' + clientIp(req), 10, 15 * 60 * 1000)) return json(res, 429, { error: TOO_MANY });
   const { email, password } = data;
   if (!email || !password) return json(res, 400, { error: 'Email and password required' });
 
@@ -3847,3 +3978,22 @@ setTimeout(() => { checkTenancyReminders().catch(e => console.error('Initial ten
 setInterval(() => { checkTenancyReminders().catch(e => console.error('Scheduled tenancy reminder check failed:', e.message)); }, 12 * 60 * 60 * 1000);
 ensureSupportAccount();
 ensureLastActiveColumn();
+
+// One-time, idempotent: convert any old base64 "hashes" into salted scrypt hashes so a
+// database leak no longer exposes passwords. Skips anything that doesn't round-trip cleanly
+// (those users are upgraded the next time they sign in).
+async function migrateLegacyPasswordHashes() {
+  try {
+    const r = await db.query("SELECT id, pass_hash FROM registrations WHERE pass_hash IS NOT NULL AND pass_hash <> '' AND pass_hash NOT LIKE 'scrypt$%'");
+    let done = 0, skipped = 0;
+    for (const row of r.rows) {
+      const plain = Buffer.from(row.pass_hash, 'base64').toString('utf8');
+      if (!plain || Buffer.from(plain).toString('base64') !== row.pass_hash) { skipped++; continue; }
+      const h = await hashPassword(plain);
+      const u = await db.query('UPDATE registrations SET pass_hash=$1 WHERE id=$2 AND pass_hash=$3', [h, row.id, row.pass_hash]);
+      done += u.rowCount || 0;
+    }
+    console.log('Password hash migration: ' + done + ' upgraded, ' + skipped + ' left for next login');
+  } catch (e) { console.warn('Password hash migration skipped:', e.message); }
+}
+setTimeout(() => { migrateLegacyPasswordHashes(); }, 5000);
