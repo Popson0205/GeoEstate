@@ -191,7 +191,19 @@ const SALES_TEAM = [
     whatsapp:  '2349131916831'
   }
 ];
-const FROM_EMAIL     = 'GeoEstate <noreply@geoestate.com.ng>';
+// ── Email identity ───────────────────────────────────────────────────────────
+// Resend only sends from a domain you have VERIFIED in its dashboard (Resend -> Domains).
+// It cannot send "from" a Gmail/Yahoo/Outlook address. So: the From address must be on your
+// verified domain, while replies (Reply-To) and contact details can be any real inbox.
+const FROM_EMAIL        = process.env.MAIL_FROM || 'GeoEstate <noreply@geoestate.com.ng>';
+// SUPPORT_EMAIL (geoestate.ng@gmail.com) is defined near the top of this file and shown in email footers.
+const REPLY_TO_EMAIL    = process.env.MAIL_REPLY_TO || SUPPORT_EMAIL;                    // where customer replies land
+const ADMIN_ALERT_EMAIL = process.env.ADMIN_ALERT_EMAIL || SUPPORT_EMAIL;                // "new registration" alerts
+const FREE_MAIL_DOMAINS = ['gmail.com','googlemail.com','yahoo.com','outlook.com','hotmail.com','live.com','icloud.com','aol.com','proton.me','protonmail.com'];
+const FROM_DOMAIN       = ((FROM_EMAIL.match(/@([^>\s]+)/) || [])[1] || '').toLowerCase();
+if (FREE_MAIL_DOMAINS.includes(FROM_DOMAIN)) {
+  console.warn('WARNING: MAIL_FROM uses ' + FROM_DOMAIN + ' - Resend cannot send from free-mail addresses. Emails will fail until MAIL_FROM is on a verified domain.');
+}
 const SITE_URL       = (process.env.SITE_URL || 'https://geoestate.com.ng').replace(/\/+$/, '');
 const VERIFY_LINK    = SITE_URL + '/?page=verify';   // opens Verify Identity (asks the user to sign in first)
 const sseClients     = new Set(); // for Server-Sent Events
@@ -299,7 +311,10 @@ function json(res, code, data) {
 
 function sendEmail(to, subject, html) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ from: FROM_EMAIL, to: [to], subject, html });
+    if (FREE_MAIL_DOMAINS.includes(FROM_DOMAIN)) {
+      return reject(new Error('Resend cannot send from a ' + FROM_DOMAIN + ' address. Verify geoestate.com.ng in Resend (Domains) and set MAIL_FROM to an address on it.'));
+    }
+    const body = JSON.stringify({ from: FROM_EMAIL, to: [to], reply_to: REPLY_TO_EMAIL, subject, html });
     const req  = https.request({
       hostname: 'api.resend.com', path: '/emails', method: 'POST',
       headers: {
@@ -443,7 +458,7 @@ function otpEmail(code, name, purpose) {
 </td></tr>
 <tr><td style="background:#f9fafb;padding:20px 40px;border-top:1px solid #f3f4f6;text-align:center">
   <div style="font-size:12px;color:#9ca3af">GeoEstate · Popson Geospatial Services · Nigeria<br>
-  <a href="mailto:admin@geoestate.com.ng" style="color:#1a6b3c">admin@geoestate.com.ng</a></div>
+  <a href="mailto:${SUPPORT_EMAIL}" style="color:#1a6b3c">${SUPPORT_EMAIL}</a></div>
 </td></tr>
 </table></td></tr></table></body></html>`;
 }
@@ -766,7 +781,7 @@ async function handleRegister(data, res, req) {
       );
     }
     await logActivity('New registration: ' + fname + ' ' + lname + ' (' + (role==='owner'?'Owner':'Renter') + ')');
-    sendEmail('admin@geoestate.com.ng', '🆕 New Registration: ' + fname + ' ' + lname, adminAlertEmail({fname,lname,email,phone,role,id:subId}))
+    sendEmail(ADMIN_ALERT_EMAIL, '🆕 New Registration: ' + fname + ' ' + lname, adminAlertEmail({fname,lname,email,phone,role,id:subId}))
       .catch(e => console.warn('Admin alert failed:', e.message));
     const token = makeOwnerToken(subId);
     json(res, 200, { success: true, submissionId: subId, token });
@@ -918,7 +933,8 @@ function htmlEsc(t) {
 // Admin-written plain text -> safe HTML (escaped, line breaks kept) wrapped in the GeoEstate email shell,
 // with a "Verify Your Identity" button that is ALWAYS appended (the customer is asked to sign in first).
 function infoRequestEmail(message) {
-  const body = htmlEsc(message).replace(/\n/g, '<br>');
+  // keep the indentation of numbered/bulleted lines (HTML would otherwise collapse leading spaces)
+  const body = htmlEsc(message).split('\n').map(l => l.replace(/^( +)/, m => '&nbsp;'.repeat(m.length))).join('<br>');
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;background:#f4f4f5;font-family:Arial,sans-serif">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 20px"><tr><td align="center">
@@ -937,7 +953,7 @@ function infoRequestEmail(message) {
 </td></tr>
 <tr><td style="background:#f9fafb;padding:20px 36px;border-top:1px solid #f3f4f6;text-align:center">
   <div style="font-size:12px;color:#9ca3af">GeoEstate \u00b7 Nigeria<br>
-  <a href="mailto:admin@geoestate.com.ng" style="color:#1a6b3c">admin@geoestate.com.ng</a></div>
+  <a href="mailto:${SUPPORT_EMAIL}" style="color:#1a6b3c">${SUPPORT_EMAIL}</a></div>
 </td></tr>
 </table></td></tr></table></body></html>`;
 }
