@@ -192,6 +192,8 @@ const SALES_TEAM = [
   }
 ];
 const FROM_EMAIL     = 'GeoEstate <noreply@geoestate.com.ng>';
+const SITE_URL       = (process.env.SITE_URL || 'https://geoestate.com.ng').replace(/\/+$/, '');
+const VERIFY_LINK    = SITE_URL + '/?page=verify';   // opens Verify Identity (asks the user to sign in first)
 const sseClients     = new Set(); // for Server-Sent Events
 
 // ── OTP store (Postgres-backed) ──────────────────────────────────────────────
@@ -861,6 +863,147 @@ async function handlePublicPropertyById(id, res) {
 }
 
 
+// ── Identity verification: what's missing? ───────────────────────────────────
+// Single source of truth used by (a) the admin "Request Info" composer and
+// (b) the customer's Verify Identity page. The required set mirrors the
+// customer form's own validation (employer / other documents are optional).
+const VERIFICATION_ITEMS = [
+  { key: 'selfie',            group: 'document', label: 'Live selfie photo' },
+  { key: 'id_doc',            group: 'document', label: 'Government-issued ID document (a clear photo or scan)' },
+  { key: 'nin',               group: 'details',  label: 'Your 11-digit NIN' },
+  { key: 'dob',               group: 'details',  label: 'Date of birth' },
+  { key: 'gender',            group: 'details',  label: 'Gender' },
+  { key: 'occupation',        group: 'details',  label: 'Occupation' },
+  { key: 'state',             group: 'details',  label: 'State of residence' },
+  { key: 'lga',               group: 'details',  label: 'Local Government Area (LGA)' },
+  { key: 'address',           group: 'details',  label: 'Residential address' },
+  { key: 'next_of_kin',       group: 'details',  label: 'Next of kin - full name' },
+  { key: 'next_of_kin_rel',   group: 'details',  label: 'Next of kin - relationship' },
+  { key: 'next_of_kin_phone', group: 'details',  label: 'Next of kin - phone number' },
+];
+function _isBlank(v) {
+  const t = String(v == null ? '' : v).trim();
+  return !t || t === '\u2014' || t === '-' || /^pending upload$/i.test(t) || /^\*+[-*]*$/.test(t);
+}
+function getVerificationGaps(r) {
+  const missing = new Set();
+  const docPart = String(r.doc || '').split('|').slice(1).join('|');
+  if (_isBlank(r.photo_url)) missing.add('selfie');
+  if (_isBlank(r.id_doc_url) && _isBlank(docPart)) missing.add('id_doc');
+  if (String(r.nin || '').replace(/\D/g, '').length !== 11) missing.add('nin');
+  for (const k of ['dob', 'gender', 'occupation', 'state', 'lga', 'address', 'next_of_kin', 'next_of_kin_rel']) {
+    if (_isBlank(r[k])) missing.add(k);
+  }
+  if (String(r.next_of_kin_phone || '').replace(/\D/g, '').length < 10) missing.add('next_of_kin_phone');
+  return VERIFICATION_ITEMS.filter(i => missing.has(i.key)).map(i => ({ key: i.key, label: i.label, group: i.group }));
+}
+function verificationOnFile(r) {
+  const gaps = new Set(getVerificationGaps(r).map(g => g.key));
+  const out = {};
+  VERIFICATION_ITEMS.forEach(i => { out[i.key] = !gaps.has(i.key); });
+  return out;
+}
+
+let _infoColsReady = false;
+async function ensureInfoRequestColumns() {
+  if (_infoColsReady) return;
+  await db.query('ALTER TABLE registrations ADD COLUMN IF NOT EXISTS info_request_message TEXT');
+  await db.query('ALTER TABLE registrations ADD COLUMN IF NOT EXISTS info_requested_at TIMESTAMPTZ');
+  _infoColsReady = true;
+}
+
+function htmlEsc(t) {
+  return String(t == null ? '' : t).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+// Admin-written plain text -> safe HTML (escaped, line breaks kept) wrapped in the GeoEstate email shell,
+// with a "Verify Your Identity" button that is ALWAYS appended (the customer is asked to sign in first).
+function infoRequestEmail(message) {
+  const body = htmlEsc(message).replace(/\n/g, '<br>');
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f4f4f5;font-family:Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f5;padding:40px 20px"><tr><td align="center">
+<table width="100%" style="max-width:560px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.08)">
+<tr><td style="background:linear-gradient(135deg,#0d3d22,#1a6b3c);padding:28px 36px;text-align:center">
+  <div style="color:#fff;font-size:22px;font-weight:800">GeoEstate</div>
+  <div style="color:rgba(255,255,255,.65);font-size:13px;margin-top:4px">Verified Real Estate \u00b7 Nigeria</div>
+</td></tr>
+<tr><td style="padding:32px 36px">
+  <div style="font-size:12px;font-weight:700;color:#b45309;background:#fffbeb;border-radius:999px;display:inline-block;padding:4px 12px;margin-bottom:18px;text-transform:uppercase;letter-spacing:.06em">Action needed</div>
+  <div style="font-size:14.5px;color:#374151;line-height:1.7">${body}</div>
+  <div style="text-align:center;margin:30px 0 8px">
+    <a href="${VERIFY_LINK}" style="display:inline-block;background:#1a6b3c;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:14px 32px;border-radius:10px">Verify Your Identity &rarr;</a>
+  </div>
+  <div style="font-size:12px;color:#9ca3af;text-align:center;line-height:1.6">You'll be asked to sign in first. Button not working? Paste this link into your browser:<br><a href="${VERIFY_LINK}" style="color:#1a6b3c;word-break:break-all">${VERIFY_LINK}</a></div>
+</td></tr>
+<tr><td style="background:#f9fafb;padding:20px 36px;border-top:1px solid #f3f4f6;text-align:center">
+  <div style="font-size:12px;color:#9ca3af">GeoEstate \u00b7 Nigeria<br>
+  <a href="mailto:admin@geoestate.com.ng" style="color:#1a6b3c">admin@geoestate.com.ng</a></div>
+</td></tr>
+</table></td></tr></table></body></html>`;
+}
+
+// POST /admin/registration/:id/request-info  { subject, message, reviewer }
+// Emails the customer, flips the registration to status 'info', stores the message
+// (shown on their Verify page) and sends an in-app/push notification.
+// The email goes out FIRST: if it can't be delivered nothing is changed, so the
+// admin can simply retry.
+async function handleAdminRequestInfo(id, data, req, res) {
+  data = data || {};
+  const subject  = String(data.subject || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 200);
+  const message  = String(data.message || '').replace(/\r\n/g, '\n').trim();
+  const reviewer = String(data.reviewer || 'Admin').replace(/[\r\n]+/g, ' ').trim().slice(0, 80) || 'Admin';
+  if (!subject) return json(res, 400, { error: 'Please add an email subject.' });
+  if (message.length < 20) return json(res, 400, { error: 'Please write a message (at least 20 characters).' });
+  if (message.length > 5000) return json(res, 400, { error: 'The message is too long (max 5,000 characters).' });
+  if (rateLimited('request-info:' + clientIp(req), 60, 60 * 60 * 1000)) return json(res, 429, { error: TOO_MANY });
+  try {
+    const r = await db.query('SELECT id, fname, lname, email, status, is_verified FROM registrations WHERE id = $1', [id]);
+    if (!r.rows.length) return json(res, 404, { error: 'Registration not found.' });
+    const u = r.rows[0];
+    if (!u.email) return json(res, 400, { error: 'This customer has no email address on file.' });
+    if (u.is_verified) return json(res, 409, { error: 'This customer is already verified - nothing to request.' });
+    if (!RESEND_API_KEY) return json(res, 503, { error: 'Email is not configured on the server (SECRET_RESEND_API_KEY is missing).' });
+
+    try {
+      await sendEmail(u.email, subject, infoRequestEmail(message));
+    } catch (e) {
+      console.error('Request-info email failed for ' + id + ':', e.message);
+      return json(res, 502, { error: 'The email could not be sent (' + e.message + '). Nothing was changed - please try again.' });
+    }
+
+    await ensureInfoRequestColumns();
+    await db.query(
+      "UPDATE registrations SET status='info', reviewer=$1, info_request_message=$2, info_requested_at=NOW(), updated_at=NOW() WHERE id=$3",
+      [reviewer, message, id]
+    );
+    await logActivity('Info requested from ' + id + ' (emailed ' + u.email + ')').catch(() => {});
+    broadcast('registration_updated', { id, status: 'info' });
+    createNotification(id, 'info_requested', 'Action needed on your verification',
+      'We need a few more details to verify your identity. Tap to continue.', { page: 'verify' }).catch(() => {});
+    json(res, 200, { success: true, emailSent: true, to: u.email });
+  } catch (e) {
+    console.error('Request-info error:', e.message);
+    json(res, 500, { error: 'Could not complete the request: ' + e.message });
+  }
+}
+
+// GET /owner/verification-status - what the signed-in customer still needs to provide
+async function handleOwnerVerificationStatus(ownerId, res) {
+  try {
+    const r = await db.query('SELECT * FROM registrations WHERE id = $1', [ownerId]);
+    if (!r.rows.length) return json(res, 404, { error: 'Account not found.' });
+    const u = r.rows[0];
+    json(res, 200, {
+      success: true,
+      status: u.status || 'pending',
+      isVerified: !!u.is_verified,
+      message: u.status === 'info' ? (u.info_request_message || '') : '',   // never expose internal reviewer notes
+      missing: getVerificationGaps(u),
+      onFile: verificationOnFile(u)
+    });
+  } catch (e) { json(res, 500, { error: 'Could not load verification status.' }); }
+}
+
 async function handleGetRegistrations(url, res) {
   try {
     const since = new URL('http://x' + url).searchParams.get('since');
@@ -892,7 +1035,10 @@ async function handleGetRegistrations(url, res) {
       photo_url: r.photo_url||'', id_doc_url: r.id_doc_url||'', other_doc_url: r.other_doc_url||'',
       nextOfKin: r.next_of_kin||'—', nextOfKinRel: r.next_of_kin_rel||'—',
       nextOfKinPhone: r.next_of_kin_phone||'—',
-      isVerified: r.is_verified||false
+      isVerified: r.is_verified||false,
+      missing: getVerificationGaps(r),
+      info_request_message: r.info_request_message || '',
+      info_requested_at: r.info_requested_at || null
     }));
     json(res, 200, { success: true, count: rows.length, registrations: rows });
   } catch(e) { json(res, 500, { error: e.message }); }
@@ -2959,7 +3105,9 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
     try {
       updateResult = await db.query(
         `UPDATE registrations SET
-          nin=$1, doc=$2, is_verified=false, status=$3,
+          nin=COALESCE(NULLIF($1,''),nin),
+          doc=CASE WHEN $16 <> '' THEN $2 ELSE doc END,
+          is_verified=false, status=$3,
           dob=COALESCE(NULLIF($5,''),dob),
           gender=COALESCE(NULLIF($6,''),gender),
           occupation=COALESCE(NULLIF($7,''),occupation),
@@ -2975,7 +3123,7 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
           other_doc_url=COALESCE(NULLIF($17,''),other_doc_url),
           updated_at=NOW()
         WHERE id=$4`,
-        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId,
+        [nin||'', (doc_type||'Government ID') + '|' + (doc_url||''), 'review', ownerId,
          dob||'', gender||'', occupation||'', employer||'',
          state||'', lga||'', address||'',
          next_of_kin||'', next_of_kin_rel||'', next_of_kin_phone||'',
@@ -2984,8 +3132,8 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
     } catch(e) {
       // Fallback: minimal update if extended columns don't exist
       updateResult = await db.query(
-        'UPDATE registrations SET nin=$1, doc=$2, is_verified=false, status=$3, photo_url=COALESCE(NULLIF($5,\'\'),photo_url), id_doc_url=COALESCE(NULLIF($6,\'\'),id_doc_url), updated_at=NOW() WHERE id=$4',
-        [nin||'', doc_type + '|' + (doc_url||''), 'review', ownerId, selfie_url||'', doc_url||'']
+        'UPDATE registrations SET nin=COALESCE(NULLIF($1,\'\'),nin), doc=CASE WHEN $6 <> \'\' THEN $2 ELSE doc END, is_verified=false, status=$3, photo_url=COALESCE(NULLIF($5,\'\'),photo_url), id_doc_url=COALESCE(NULLIF($6,\'\'),id_doc_url), updated_at=NOW() WHERE id=$4',
+        [nin||'', (doc_type||'Government ID') + '|' + (doc_url||''), 'review', ownerId, selfie_url||'', doc_url||'']
       );
     }
     // Same guard as above, after the actual save attempt: if this matched
@@ -2994,6 +3142,7 @@ async function handleOwnerVerifyIdentity(ownerId, data, res) {
       return json(res, 404, { error: 'We could not save your verification — please sign out and log back in, then try again.' });
     }
     await logActivity('Owner identity submitted for review: ' + ownerId);
+    broadcast('registration_updated', { id: ownerId, status: 'review' });   // refresh the admin queue live
     json(res, 200, { success: true, message: 'Identity submitted. You will be notified once verified (usually within 24 hours).' });
   } catch(e) { json(res, 500, { error: e.message }); }
 }
@@ -3655,6 +3804,7 @@ const server = http.createServer((req, res) => {
       const ownerId = requireOwner(req, res);
       if (!ownerId) return;
       if (url === '/owner/profile')          return handleOwnerProfile(ownerId, res);
+      if (url === '/owner/verification-status') return handleOwnerVerificationStatus(ownerId, res);
       if (url === '/owner/properties')       return handleOwnerProperties(ownerId, urlFull, res);
       if (url === '/owner/enquiries')        return handleOwnerEnquiries(ownerId, res);
       if (url === '/owner/tenancies')        return handleOwnerTenancies(ownerId, res);
@@ -3810,6 +3960,8 @@ const server = http.createServer((req, res) => {
           if (url === '/admin/save-payment')        return handleSavePayment(data, res);
           if (url === '/admin/save-transaction')    return handleSaveTransaction(data, res);
           if (url === '/admin/support-staff')       return handleAddSupportStaff(data, res);
+          const reqInfoMatch = url.match(/^\/admin\/registration\/([^/]+)\/request-info$/);
+          if (reqInfoMatch) return handleAdminRequestInfo(decodeURIComponent(reqInfoMatch[1]), data, req, res);
           const handoverMatch = url.match(/^\/admin\/payment\/([^/]+)\/handover$/);
           if (handoverMatch) return handleConfirmHandover(req, res, handoverMatch[1]);
           const staffRegenMatch = url.match(/^\/admin\/support-staff\/(\d+)\/regenerate$/);
